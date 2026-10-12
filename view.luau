@@ -97,7 +97,8 @@ function view_mod.fingerprint(snap: model.Snapshot): string
 		local tf = snap.flags[t.id]
 		local flag_str = ""
 		if tf then
-			flag_str = (if tf.busy then "B" else "") .. (if tf.waiting then "W" else "") .. (if tf.alert then "A" else "")
+			flag_str = (if tf.busy then "B" else "") .. (if tf.waiting then "W" else "")
+			flag_str ..= (if tf.alert then "A" else "") .. (if tf.done then "D" else "")
 		end
 		local col = t.color or tern.kv.get("tab_color_" .. t.id) or ""
 		table.insert(parts, "t" .. t.id .. ":" .. col .. ":" .. flag_str .. ":" .. (t.name or t.title or t.cwd or ""))
@@ -138,11 +139,13 @@ function view_mod.build(snap: model.Snapshot): Node
 		local session_tabs = snap.tabs_of[s.id] or {}
 		local ws_busy = 0
 		local ws_waiting = 0
+		local ws_done = 0
 		for _, t in session_tabs do
 			local f = snap.flags[t.id]
 			if f then
 				if f.busy then ws_busy += 1 end
 				if f.waiting then ws_waiting += 1 end
+				if f.done then ws_done += 1 end
 			end
 		end
 
@@ -224,6 +227,15 @@ function view_mod.build(snap: model.Snapshot): Node
 				role = "ws-status",
 			}))
 		end
+		-- Los turnos que terminaron y nadie miró: ✓ celeste, no el `!` rojo (no fallaron).
+		if ws_done > 0 then
+			table.insert(header_cells, tern.ui.node("badge", {
+				key = "ws_done_" .. s.id,
+				text = ws_done .. "✓",
+				tone = "info",
+				role = "ws-done",
+			}))
+		end
 
 		if in_move_mode then
 			table.insert(header_cells, tern.ui.node("badge", {
@@ -286,11 +298,25 @@ function view_mod.build(snap: model.Snapshot): Node
 							role = "ws-status",
 						}))
 					elseif tf.alert then
+						-- El `!` rojo va antes del ✓ a propósito: un tab con más de un agente
+						-- —uno que terminó su turno y otro que falló— lleva las dos banderas, y
+						-- un error no puede pasar por éxito.
 						table.insert(tab_cells, tern.ui.node("badge", {
 							key = "tab_alert_" .. t.id,
 							text = "!",
 							tone = "error",
 							role = "ws-status",
+						}))
+					elseif tf.done then
+						-- El ✓ celeste: el agente terminó su turno en una tab que no mirabas, y
+						-- sigue sin verse hasta que la enfoques (ahí Tern limpia su `alert`).
+						-- Glifo propio en vez del `!`: terminó bien, no falló. El color lo pone
+						-- el role (`sidebar.css`, celeste propio), no el tono del tema.
+						table.insert(tab_cells, tern.ui.node("badge", {
+							key = "tab_done_" .. t.id,
+							text = "✓",
+							tone = "info",
+							role = "ws-done",
 						}))
 					end
 				end

@@ -34,6 +34,10 @@
 	--wsp-press: color-mix(in srgb, var(--t1) 15%, transparent);
 	--wsp-sel: color-mix(in srgb, var(--t1) 9%, transparent);
 	--wsp-icon: var(--t3);
+	/* El celeste del badge de completion-unseen (`role='ws-done'`): el token del tema si
+	   lo trae, y si no, el celeste medido del rail. Ni verde (un turno terminado no es un
+	   éxito que festejar) ni el `--accent` del tema (que puede ser cualquier color). */
+	--wsp-done: var(--info, var(--cyan, #3fd3ff));
 
 	padding: var(--wsp-pad) calc(var(--wsp-pad) + 2px);
 	font-family: var(--sans) !important;
@@ -108,7 +112,8 @@
 }
 
 /* Badges: un chip por estado, tintado con el color del tono (--tc viene del
-   prop `tone`: warn = ? , accent = ◐ , error = ! , muted = ◆ y acciones). */
+   prop `tone`: warn = ? , accent = ◐ , error = ! , muted = ◆ y acciones; el ✓ de
+   completion-unseen lleva su propio celeste por role, ver abajo). */
 .sf-region[data-surface$='.canvas'] .sf-badge {
 	font-family: inherit;
 	font-size: inherit;
@@ -133,6 +138,14 @@
 /* Los badges de tono apagado no deben leerse como deshabilitados. */
 .sf-region[data-surface$='.canvas'] .sf-badge[data-tone='muted'] {
 	color: color-mix(in srgb, var(--tc) 60%, var(--t1));
+}
+
+/* El ✓ de "el agente terminó y no lo viste": su celeste manda sobre el tono del chip
+   —color y fondo—, así el glifo se lee igual en cualquier tema. Va después de la regla
+   del `muted` porque tiene la misma especificidad. */
+.sf-region[data-surface$='.canvas'] .sf-badge[data-role='ws-done'] {
+	color: var(--wsp-done);
+	background-color: color-mix(in srgb, var(--wsp-done) 16%, transparent);
 }
 
 /* Con el puntero sobre la fila, sus badges se afirman. */

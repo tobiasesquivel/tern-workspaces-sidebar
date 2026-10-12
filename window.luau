@@ -11,6 +11,7 @@ local layout_mod = require("./layout")
 local view_mod = require("./view")
 local git = require("./git")
 local worktrees = require("./worktrees")
+local sound = require("./sound")
 
 local TITLE = "Workspaces"
 local HOME = tern.getenv("HOME") or ""
@@ -25,8 +26,10 @@ end
 -- One repaint. Reads the window once into a snapshot, compares its fingerprint and
 -- only then pays for the tree, so a no-op event costs a snapshot and nothing else.
 --
--- Nothing in here starts a git read or a process: `model.snapshot` works off the
--- caches, and the read tick is the only writer. A repaint therefore fits the 50 ms
+-- Nothing in here starts a git read or a process, and nothing in here reads the agents
+-- either: `model.snapshot` draws its badges from the state the read tick's poll cached.
+-- That is what keeps a paint from consuming a move the chime still owes you, and what
+-- lets the rail be unmounted without muting anything. A repaint therefore fits the 50 ms
 -- window budget no matter how many sessions the rail lists.
 local function refresh(cx: WindowCx)
 	local panes = mine(cx)
@@ -342,18 +345,12 @@ local function step(cx: WindowCx, d: number)
 	end
 end
 
--- Attention jump across all sessions
+-- Attention jump across all sessions. The agent half of the test is the state the read
+-- tick's poll cached (`model.observed_agent`), never a read of its own: a second reader here
+-- would be a reader that can fall out of step with the badge and the chime, and it would
+-- consume nothing the poll already said. A read that failed leaves that cache standing, so a
+-- jump still finds the question the poll last saw.
 local function find_attention_tab(cx: WindowCx): (number?, number?)
-	local agent_map: { [number]: string } = {}
-	local ok_ag, agents = pcall(function() return cx.agents:list() end)
-	if ok_ag and agents then
-		for _, a in agents do
-			if a.pane and a.state == "waiting_input" then
-				agent_map[a.pane] = a.state
-			end
-		end
-	end
-
 	for _, t in cx.session:tabs() do
 		local l = cx.session:layout(t.id)
 		if l and l.root then
@@ -362,8 +359,12 @@ local function find_attention_tab(cx: WindowCx): (number?, number?)
 				if tree.pane then
 					local pinfo = cx.session:pane(tree.pane)
 					if pinfo and not model.is_mine(cx, tree.pane) then
-						local ag_state = agent_map[tree.pane]
-						if ag_state == "waiting_input" or pinfo.alert or (pinfo.last and pinfo.last.status ~= 0) then
+						-- The same test as ever, in the same tab and tree order: a question
+						-- the poll cached, or the pane's own alert flags.
+						if model.observed_agent(tree.pane) == "waiting_input"
+							or pinfo.alert
+							or (pinfo.last and pinfo.last.status ~= 0)
+						then
 							return tree.pane
 						end
 					end
@@ -516,6 +517,20 @@ tern.command({
 		if next_val then
 			model.auto_close_empty_tabs(cx)
 		end
+	end,
+})
+tern.command({
+	id = "toggle_sounds",
+	title = "Workspaces: toggle notification sounds",
+	icon = "bell",
+	run = function(cx)
+		local cur = tern.kv.get("sound_enabled")
+		if cur == nil then
+			cur = true
+		end
+		local next_val = not cur
+		tern.kv.set("sound_enabled", next_val)
+		cx:toast("info", "Notification sounds: " .. (if next_val then "ON" else "OFF"))
 	end,
 })
 tern.command({ id = "next", title = "Workspaces: next", keys = { "cmd+alt+shift+]" }, run = function(cx) step(cx, 1) end })
@@ -964,16 +979,36 @@ tern.on("canvas_action", canvas_action)
 local READ_MS = 250
 local PAINT_MS = 250
 
---- Read tick: one git read and nothing else. The rail's git answers are the only reason
---- this plugin ever came close to the budget; one read per call keeps every call far
---- inside it. Seven sessions cost seven ticks (about 1.75 s) to fill in, and each answer
---- repaints on a later paint tick, through the fingerprint's generation counter.
+--- Read tick: the I/O tick — the agent poll, the chime it earns, and one git read, never
+--- both. The budget is per hook and a spawn is its expensive half, so a tick that starts the
+--- player leaves the git read for the next tick (which finds no new move and takes it). The
+--- poll is the only place this plugin reads `cx.agents:list`, and the chime rides here
+--- rather than in a paint because playing it spawns a process, which no paint tick may do.
+--- The rail's git answers are the only other reason this plugin ever came close to the
+--- budget; one read per call keeps every call far inside it. Seven sessions cost seven
+--- ticks (about 1.75 s) to fill in, and each answer repaints on a later paint tick, through
+--- the fingerprint's generation counter.
 local function read_tick(cx: WindowCx?)
 	tern.timer(READ_MS, read_tick)
 	if not cx then
 		return
 	end
+	-- Poll, judge and play in this one invocation, before the git read: the read tick is
+	-- what hears an agent move. Nothing here waits for a repaint, and whether the rail is
+	-- mounted or has been repainted does not enter into it. The flush is ahead of the early
+	-- return below, so a chime never waits on a git read being stale.
+	local ok_moves, moves = pcall(model.poll_agents, cx)
+	if ok_moves then
+		pcall(sound.observe, moves)
+	end
+	local ok_played, played = pcall(sound.flush)
 	model.invalidate()
+	if ok_played and played == true then
+		-- The hook's budget is per call, and the player was this call's one spawn: the git
+		-- read waits for the next tick, which finds no new move to judge and takes it. At
+		-- most one process starts per hook, chime or git, never both.
+		return
+	end
 	local ok, read = pcall(model.next_read, cx)
 	if not ok or not read then
 		return

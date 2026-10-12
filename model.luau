@@ -133,29 +133,100 @@ end
 export type TabFlags = {
 	busy: boolean,
 	waiting: boolean,
+	--- An unseen warning that is not a finished turn: a command or a program that failed
+	--- (`alert`, the `!` badge).
 	alert: boolean,
+	--- A finished turn nobody has looked at yet: Tern's unseen alert on an agent that is
+	--- back to `idle`. Its own flag and its own badge (the cyan `✓`) because a turn that
+	--- ended well is not a failure — the two used to be the same `!`.
+	done: boolean,
 	is_agent: boolean,
 }
+
+--- The agent state last observed, by pane. One map, the single source the tab badges
+--- (`flags_from`, through the snapshot) and the chimes (`observe_agents`, through the read
+--- tick's poll) both read, so what the rail draws and what it plays can never come from two
+--- different ideas of what an agent is doing. Module-level: one rail, one observation. Only
+--- `observe_agents` writes it, and a failed read never does (see there).
+local observed: { [number]: string } = {}
+
+--- The states a fresh `agents:list()` lists, by pane id. Pure: one loop over the list the
+--- caller already read — never a second `agents:list`. Keyed by `pane` and not by `agent`,
+--- which is what keeps several agents of one tab apart.
+local function states_of(agents: { any }): { [number]: string }
+	local out: { [number]: string } = {}
+	for _, a in agents do
+		if a.pane then
+			out[a.pane] = a.state
+		end
+	end
+	return out
+end
+
+--- One agent that moved between two polls: its pane, the state it was in (nil on a first
+--- sighting) and the one it is in now, plus whether its pane sits in the tab you are on —
+--- the fact the chime rule needs and the model knows.
+export type AgentMove = { pane: number, prev: string?, next: string, active: boolean }
+
+--- Folds one `agents:list()` answer — as `states_of` folded it under `model.poll_agents` —
+--- into the observed state and reports the moves it made. Pure in, moves out: no second
+--- `agents:list`, no file, no process. Called only by the poll, never by a paint.
+---
+--- `states == nil` is a read that failed: the state is left exactly as it was, so a
+--- transition this poll cannot judge is judged by the next one — delayed, never missed.
+--- An unusable pane list is the same case: nothing is replaced, because a move cannot be
+--- attributed to a tab without it. A map — even an empty one, the rail with no agents at
+--- all — replaces the state, so an agent that is gone is forgotten and a later agent in
+--- its pane seeds fresh instead of inheriting the moves of a program it is not.
+function model.observe_agents(
+	states: { [number]: string }?,
+	panes: { [number]: PaneInfo }?,
+	focused_tab: number?
+): { AgentMove }
+	if states == nil or panes == nil or next(panes) == nil then
+		return {}
+	end
+	local moves: { AgentMove } = {}
+	for pane, state in states do
+		local prev = observed[pane]
+		if prev ~= state then
+			local info = panes[pane]
+			table.insert(moves, {
+				pane = pane,
+				prev = prev,
+				next = state,
+				active = info ~= nil and info.tab ~= nil and info.tab == focused_tab,
+			})
+		end
+	end
+	-- By pane, so the queue one poll leaves is the same whatever order the read came back
+	-- in (a table walk is not ordered).
+	table.sort(moves, function(a: AgentMove, b: AgentMove): boolean
+		return a.pane < b.pane
+	end)
+	observed = states
+	return moves
+end
+
+--- The state the poll observed for one pane, or nil when it has seen no agent there. The
+--- pane-level view of the same cache the badges read per tab: a consumer that needs one pane
+--- — the attention jump — looks it up here instead of reading `agents:list` again.
+function model.observed_agent(pane: number): string?
+	return observed[pane]
+end
 
 --- Per-tab status badges from panes + agent states (keyed by AgentBlock.pane, NOT
 --- .agent). Pure: both reads arrive as arguments, so one snapshot builds the flags
 --- once for the fingerprint and for the draw.
-function model.flags_from(panes: { PaneInfo }, agents: { any }?): { [number]: TabFlags }
+function model.flags_from(panes: { PaneInfo }, agents: { [number]: string }?): { [number]: TabFlags }
 	local out: { [number]: TabFlags } = {}
-	local agent_map: { [number]: string } = {}
-	if agents then
-		for _, a in agents do
-			if a.pane then
-				agent_map[a.pane] = a.state
-			end
-		end
-	end
+	local agent_map: { [number]: string } = agents or {}
 
 	for _, p in panes do
 		if p.tab then
 			local tf = out[p.tab]
 			if not tf then
-				tf = { busy = false, waiting = false, alert = false, is_agent = false }
+				tf = { busy = false, waiting = false, alert = false, done = false, is_agent = false }
 				out[p.tab] = tf
 			end
 			local ag_state = agent_map[p.pane]
@@ -176,7 +247,19 @@ function model.flags_from(panes: { PaneInfo }, agents: { any }?): { [number]: Ta
 			if ag_state == "waiting_input" then
 				tf.waiting = true
 			end
-			if p.alert or (p.last and p.last.status ~= 0) then
+			-- `pane.alert` is Tern's own "you have not seen this": it is raised when an agent
+			-- stops in a pane you are not looking at, and cleared when the pane is focused.
+			-- One flag, two very different things, told apart by what the agent is now: an
+			-- agent back to `idle` finished its turn (`done`, the cyan `✓`), while a non-zero
+			-- `last.status` — a command or a program that failed — is an error (`alert`, the
+			-- red `!` as before). A pane the agent list has no entry for keeps the old
+			-- reading at the pane level: an unseen alert with nothing to explain it is an
+			-- alert, and so is an agent that is not idle (`exited`, or a question that the
+			-- `waiting` branch paints first).
+			local failed = p.last ~= nil and p.last.status ~= 0
+			if p.alert and not failed and ag_state == "idle" then
+				tf.done = true
+			elseif p.alert or failed then
 				tf.alert = true
 			end
 			if p.kind == "agent" then
@@ -187,15 +270,13 @@ function model.flags_from(panes: { PaneInfo }, agents: { any }?): { [number]: Ta
 	return out
 end
 
---- The same flags, reading the window itself. Only for callers that hold no snapshot.
+--- The same flags, reading the panes from the window. Only for callers that hold no
+--- snapshot. The agent states are the poll's cache (`observed`), never a read of its own.
 function model.collect_tab_flags(cx: WindowCx): { [number]: TabFlags }
-	local ok_ag, agents = pcall(function()
-		return cx.agents:list()
-	end)
 	local ok_p, panes = pcall(function()
 		return cx.session:panes()
 	end)
-	return model.flags_from(if ok_p and panes then panes else {}, if ok_ag and agents then agents else nil)
+	return model.flags_from(if ok_p and panes then panes else {}, observed)
 end
 
 --- Pane info by pane id, for the tab labels: one read instead of one per tab.
@@ -265,6 +346,25 @@ function model.worktree_live(cx: WindowCx, session_id: number): worktrees.Info?
 	return worktrees.info_for(cwd)
 end
 
+--- The one place the plugin reads the agents: the read tick's poll. Reads the window's
+--- agent list, its panes and its focused tab, folds the list into per-pane states and hands
+--- them to `observe_agents`, which folds them into the single observed state and returns the
+--- moves. It never draws: the paint reads that same observed state (see `snapshot`), which
+--- is why a question cannot be shown before it has been heard. Returns the moves, for the
+--- read tick to hand to `sound.observe` in the same invocation.
+function model.poll_agents(cx: WindowCx): { AgentMove }
+	local ok_ag, agents = pcall(function()
+		return cx.agents:list()
+	end)
+	local ok_p, panes = pcall(function()
+		return cx.session:panes()
+	end)
+	local states: { [number]: string }? = if ok_ag and agents then states_of(agents) else nil
+	local focused_pane = cx.session:focused()
+	local focused_tab = if focused_pane then cx.session:tab_of(focused_pane) else nil
+	return model.observe_agents(states, panes_by_id(if ok_p and panes then panes else {}), focused_tab)
+end
+
 -- The rail's rows: the session list in order, with each repo's worktrees nested under
 -- the session that holds its main checkout. Pure map work over the cached read, so a
 -- draw can call it; the nesting rules live in group.luau.
@@ -303,11 +403,13 @@ end
 --- Everything one repaint needs, read once. A draw is on the window's UI thread with a
 --- 50 ms budget, so the number of `cx` calls per repaint is the thing to keep small:
 --- this does one `sessions:list`, one `session:tabs`, one `session:panes`, one
---- `agents:list`, one `session:focused` and cache lookups, and the fingerprint and the
---- tree then work off these tables instead of re-reading the window between them.
+--- `session:focused` and cache lookups, and the fingerprint and the tree then work off
+--- these tables instead of re-reading the window between them.
 ---
 --- Nothing here starts a process or a git read: `wt` and `head` come from the caches,
---- and nil means "not known yet" (the poll fills those in).
+--- and nil means "not known yet" (the poll fills those in). Nor does it read the agents:
+--- the flags come from the state the read tick's poll cached (`model.poll_agents`), so a
+--- paint can never consume a move and hears nothing on its own.
 export type Snapshot = {
 	sessions: { ManagedSession },
 	--- The current session's id.
@@ -333,9 +435,6 @@ function model.snapshot(cx: WindowCx): Snapshot
 	local tabs = cx.session:tabs()
 	local ok_p, panes = pcall(function()
 		return cx.session:panes()
-	end)
-	local ok_a, agents = pcall(function()
-		return cx.agents:list()
 	end)
 	local pane_list: { PaneInfo } = if ok_p and panes then panes else {}
 
@@ -370,7 +469,7 @@ function model.snapshot(cx: WindowCx): Snapshot
 		tabs = tabs,
 		tabs_of = tabs_by_session(tabs, sessions),
 		panes = panes_by_id(pane_list),
-		flags = model.flags_from(pane_list, if ok_a and agents then agents else nil),
+		flags = model.flags_from(pane_list, observed),
 		rows = rows,
 		folded = model.fold_rows(rows, current),
 		wt = wt,
