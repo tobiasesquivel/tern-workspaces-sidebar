@@ -1,0 +1,11 @@
+# Development material, kept out of the published plugin: the suites and the fixture they
+# need, the measurement notes and the notes for agents working on this repo.
+AGENTS.md
+research/
+test/
+
+# Written by the offline check when it runs from here.
+harness.lua
+
+# Layout dumps from Tern.
+*.layout.json

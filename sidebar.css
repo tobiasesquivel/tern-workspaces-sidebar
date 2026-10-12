@@ -1,0 +1,196 @@
+/* ---------------------------------------------------------------------------
+   Workspaces Sidebar Polish — adapta el panel de `workspaces-sidebar` al estilo
+   de Tern.
+
+   Qué arregla (medido en el DOM real):
+   1. Tipografía mezclada: las etiquetas usaban la fuente del terminal (mono, 15px)
+      y los badges la fuente de la interfaz (Geist, 12.7px) en la misma fila.
+      Ahora todo el panel usa la fuente de la interfaz, como las barras laterales
+      propias de Tern (panel Files, columna de tabs).
+   2. Sin feedback: los nodos con click daban cursor de flecha pero ningún cambio
+      al pasar por encima. Ahora hay fondo en hover, y :active al presionar.
+   3. Distribución: las filas no compartían altura ni alineación, y los textos
+      largos (rutas) se cortaban a mitad de palabra. Ahora: filas de altura fija,
+      etiqueta a la izquierda, badges alineados a la derecha, y corte con "…".
+   4. Cromo: badges como chips tintados con el color del tono, separador más
+      discreto.
+
+   Alcance: SOLO los canvas de plugins ([data-surface$='.canvas']). No toca el
+   transcript de omp, ni el panel Files, ni la columna de tabs.
+
+   Medidas: dentro de una región los px se escalan por (fuente del terminal / 13),
+   así que 12.5px acá se ven como la letra del panel Files de Tern.
+--------------------------------------------------------------------------- */
+
+.sf-region[data-surface$='.canvas'] {
+	--wsp-fs: 12.5px;
+	--wsp-row: 24px;
+	--wsp-pad: 8px;
+	--wsp-radius: 5px;
+	--wsp-chip: 5px;
+	/* Velo neutro (como la fila activa del panel Files de Tern), no azul:
+	   el acento queda para el estado y el foco. */
+	--wsp-hover: color-mix(in srgb, var(--t1) 9%, transparent);
+	--wsp-press: color-mix(in srgb, var(--t1) 15%, transparent);
+	--wsp-sel: color-mix(in srgb, var(--t1) 9%, transparent);
+	--wsp-icon: var(--t3);
+
+	padding: var(--wsp-pad) calc(var(--wsp-pad) + 2px);
+	font-family: var(--sans) !important;
+	font-size: var(--wsp-fs) !important;
+	line-height: 16px;
+	font-variant-numeric: tabular-nums;
+	letter-spacing: 0.005em;
+	cursor: default;
+}
+
+/* Filas: un solo ritmo vertical, todo centrado, hover visible. */
+.sf-region[data-surface$='.canvas'] .sf-col {
+	gap: 2px;
+}
+
+.sf-region[data-surface$='.canvas'] .sf-row {
+	align-items: center;
+	min-height: var(--wsp-row);
+	padding: 0 4px;
+	gap: 4px;
+	border-radius: var(--wsp-radius);
+	transition: background-color 110ms ease;
+}
+
+.sf-region[data-surface$='.canvas'] .sf-row:hover {
+	background-color: var(--wsp-hover);
+}
+
+.sf-region[data-surface$='.canvas'] .sf-row.sf-act:active,
+.sf-region[data-surface$='.canvas'] .sf-text.sf-act:active {
+	background-color: var(--wsp-press);
+}
+
+/* Etiquetas: ocupan el espacio libre y cortan con puntos suspensivos, en vez de
+   partir una ruta al medio. Los badges quedan pegados al borde derecho. */
+.sf-region[data-surface$='.canvas'] .sf-row > .sf-text {
+	flex: 1 1 auto;
+	min-width: 0;
+	overflow: hidden;
+	white-space: nowrap;
+	text-overflow: ellipsis;
+}
+
+/* La rama de un checkout: celda propia que se achica hasta desaparecer cuando el
+   rail es angosto, así el nombre nunca le pierde lugar. */
+.sf-region[data-surface$='.canvas'] .sf-row > .sf-text[data-role='ws-branch'] {
+	flex: 0 1 auto;
+	color: var(--t3);
+}
+
+/* La sangría de un checkout anidado: una celda vacía de ancho fijo, no un padding,
+   así la fila sigue siendo la misma (y conserva su resaltado cuando es la actual). */
+.sf-region[data-surface$='.canvas'] .sf-row > .sf-text[data-role='ws-indent'] {
+	flex: 0 0 12px;
+	min-width: 12px;
+}
+
+/* Ahead/behind (↑ahead ↓behind): los colores los pone cada span (verde arriba, rojo
+   abajo), así que acá no hay `color`; solo el ancho de los números, para que no
+   bailen al cambiar de dígito. */
+.sf-region[data-surface$='.canvas'] .sf-row > .sf-text[data-role='ws-ab'] {
+	flex: 0 0 auto;
+	font-variant-numeric: tabular-nums;
+}
+
+.sf-region[data-surface$='.canvas'] .sf-text.sf-act {
+	border-radius: var(--wsp-radius);
+	transition: background-color 110ms ease, color 110ms ease;
+}
+.sf-region[data-surface$='.canvas'] .sf-text.sf-act:hover {
+	background-color: var(--wsp-hover);
+}
+
+/* Badges: un chip por estado, tintado con el color del tono (--tc viene del
+   prop `tone`: warn = ? , accent = ◐ , error = ! , muted = ◆ y acciones). */
+.sf-region[data-surface$='.canvas'] .sf-badge {
+	font-family: inherit;
+	font-size: inherit;
+	line-height: inherit;
+	font-variant-numeric: tabular-nums;
+	min-height: 16px;
+	/* ancho uniforme: los badges de todas las filas caen en la misma columna */
+	min-width: 20px;
+	justify-content: center;
+	padding: 0 5px;
+	border-radius: var(--wsp-chip);
+	background-color: rgb(from var(--tc) r g b / 16%);
+	opacity: 1;
+	transition: opacity 110ms ease, background-color 110ms ease;
+}
+
+.sf-region[data-surface$='.canvas'] .sf-badge.sf-act:hover {
+	opacity: 1;
+	background-color: rgb(from var(--tc) r g b / 30%);
+}
+
+/* Los badges de tono apagado no deben leerse como deshabilitados. */
+.sf-region[data-surface$='.canvas'] .sf-badge[data-tone='muted'] {
+	color: color-mix(in srgb, var(--tc) 60%, var(--t1));
+}
+
+/* Con el puntero sobre la fila, sus badges se afirman. */
+.sf-region[data-surface$='.canvas'] .sf-row:hover .sf-badge {
+	opacity: 1;
+}
+
+/* Separador entre espacios (tern.ui.rule). */
+.sf-region[data-surface$='.canvas'] .sf-rule {
+	margin: 6px 2px;
+	opacity: 0.55;
+}
+
+/* ---------------------------------------------------------------------------
+   Coherencia con el explorador de Tern (panel Files): iconos de 16px en gris,
+   fila actual marcada, y las acciones de la fila escondidas hasta que el puntero
+   entra. Los roles (`role` del nodo -> data-role) los pone el plugin.
+--------------------------------------------------------------------------- */
+
+.sf-region[data-surface$='.canvas'] .sf-icon {
+	flex: 0 0 auto;
+	margin-right: 1px;
+	color: var(--wsp-icon);
+	transition: color 110ms ease;
+}
+
+.sf-region[data-surface$='.canvas'] .sf-icon[data-tone] {
+	color: var(--tc);
+}
+
+.sf-region[data-surface$='.canvas'] .sf-row:hover .sf-icon[data-role='ws-icon'] {
+	color: var(--t1);
+}
+
+/* La fila del workspace o tab actual, como la fila seleccionada de Files. */
+.sf-region[data-surface$='.canvas'] .sf-row[data-role='ws-space-current'],
+.sf-region[data-surface$='.canvas'] .sf-row[data-role='ws-tab-current'] {
+	background-color: var(--wsp-sel);
+}
+
+/* El botón de menú (⋯) aparece solo con el puntero sobre su fila. */
+.sf-region[data-surface$='.canvas'] [data-role='ws-more'] {
+	opacity: 0;
+	cursor: pointer;
+	transition: opacity 110ms ease, color 110ms ease;
+}
+
+.sf-region[data-surface$='.canvas'] .sf-row:hover [data-role='ws-more'] {
+	opacity: 0.7;
+}
+
+.sf-region[data-surface$='.canvas'] [data-role='ws-more']:hover {
+	opacity: 1;
+	color: var(--accent);
+}
+
+/* El candado de un workspace bloqueado: información, no botón. */
+.sf-region[data-surface$='.canvas'] [data-role='ws-lock'] {
+	flex: 0 0 auto;
+}
+

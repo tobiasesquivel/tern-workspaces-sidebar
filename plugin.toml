@@ -1,0 +1,8 @@
+schema = 1
+id = "workspaces-sidebar"
+name = "Workspaces Sidebar"
+version = "0.2.0"
+description = "Every session as a workspace in a sidebar, with git counters and the state of each agent."
+icon = "sidebar"
+window = "window.luau"
+styles = ["sidebar.css"]

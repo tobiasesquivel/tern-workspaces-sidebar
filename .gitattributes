@@ -1,0 +1,3 @@
+# LF everywhere, so the shell script stays runnable (a CRLF shebang breaks it) and the Luau
+# sources and docs are byte-identical on every platform.
+* text=auto eol=lf
