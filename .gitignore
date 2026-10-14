@@ -12,3 +12,6 @@ harness.lua
 
 # Captures from the agent-runtime lab.
 target/
+
+# Agent worktrees.
+.claude/
