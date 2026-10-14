@@ -293,6 +293,19 @@ describe("screen state (herdr: the screen decides Claude, Codex hooks win but fo
     assert.equal(s.get(6).completion_seq, null);
   });
 
+  it("startup dialogs answered into the first idle are no finished turn, even after a flicker of work", () => {
+    // Measured with codex 0.159.1: between the trust and the sandbox dialogs the
+    // screen read `working` once, which ended the acquisition, and the sandbox
+    // answer then read as a completion — `done` and its sound for a launch.
+    const s = new RuntimeState();
+    s.claim({ pane_id: 11, agent: "codex", launch_id: "L11" });
+    s.detect(11, S("codex", "blocked", { visible_blocker: true, rule: "trust_directory", at: 1 }));
+    s.detect(11, S("codex", "working", { at: 2 }));
+    s.detect(11, S("codex", "blocked", { visible_blocker: true, rule: "codex_sandbox_setup", at: 3 }));
+    s.detect(11, S("codex", "idle", { visible_idle: true, at: 4 }));
+    assert.deepEqual([s.get(11).agent_status, s.get(11).completion_seq, s.get(11).interactive_ready], ["idle", null, true]);
+  });
+
   it("readiness: a pending Claude or Codex is ready on its first idle screen; blocked keeps it pending", () => {
     const s = new RuntimeState();
     s.claim({ pane_id: 7, agent: "codex", launch_id: "L7" });
@@ -340,7 +353,10 @@ describe("omp start readiness (bug: ready inside the first-run wizard)", () => {
     assert.equal(s.get(20).interactive_ready, false, "no screen read yet");
     s.detect(20, S("omp", "blocked", { visible_blocker: true, rule: "omp_setup_wizard", at: 1 }));
     assert.deepEqual([s.get(20).agent_status, s.get(20).message, s.get(20).launch_pending], ["blocked", "omp_setup_wizard", true]);
+    // A screen with no visible prompt (omp's splash) is no ready evidence.
     s.detect(20, S("omp", "idle", { at: 2 }));
+    assert.equal(s.get(20).interactive_ready, false);
+    s.detect(20, S("omp", "idle", { visible_idle: true, rule: "omp_prompt_ready", at: 3 }));
     assert.deepEqual([s.get(20).agent_status, s.get(20).interactive_ready, s.get(20).launch_pending], ["idle", true, false]);
     assert.equal(s.get(20).terminal_id, c.terminal_id);
   });
@@ -357,7 +373,7 @@ describe("omp start readiness (bug: ready inside the first-run wizard)", () => {
     const s = new RuntimeState();
     s.claim({ pane_id: 22, agent: "omp", launch_id: "L22" });
     s.report(R(22, "L22", { state: "idle", seq: 1, ready: true }));
-    s.detect(22, S("omp", "idle", { at: 1 }));
+    s.detect(22, S("omp", "idle", { visible_idle: true, at: 1 }));
     s.report(R(22, "L22", { state: "working", seq: 2 }));
     s.detect(22, S("omp", "blocked", { visible_blocker: true, rule: "omp_setup_wizard", at: 2 }));
     assert.equal(s.get(22).agent_status, "working");

@@ -430,7 +430,7 @@ describe("end to end against the real RuntimeState", () => {
     await reporter.flush();
     // The daemon's detection loop reads the startup screen once: no setup
     // wizard, so the extension's ready stands.
-    state.detect(PANE_ID, { agent: "omp", state: "idle", at: Date.now() });
+    state.detect(PANE_ID, { agent: "omp", state: "idle", visible_idle: true, rule: "omp_prompt_ready", at: Date.now() });
     const blocked = state.get(String(PANE_ID));
     assert.equal(blocked.agent_status, "blocked");
     assert.equal(blocked.message, "Allow this edit?");

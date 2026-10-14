@@ -180,7 +180,11 @@ describe("detection loop", () => {
     w.state.report({ v: 1, pane_id: 9, launch_id: "L9", source: "tern:omp", agent: "omp", state: "idle", seq: 1, ready: true });
     await run(w, 4000);
     assert.deepEqual([w.state.get(9).agent_status, w.state.get(9).launch_pending], ["blocked", true]);
-    w.screens[9] = " π > ⬢ model > scratch\n";
+    // omp's splash first: no prompt on screen, no ready.
+    w.screens[9] = "   ✧      ·        ✦\n        ████████\n";
+    await run(w, 4600);
+    assert.equal(w.state.get(9).interactive_ready, false);
+    w.screens[9] = " π > ⬢ model > scratch ▶────\n────\n╰─\n";
     await run(w, 5000);
     assert.deepEqual([w.state.get(9).agent_status, w.state.get(9).interactive_ready], ["idle", true]);
     const n = w.calls.capture.length;

@@ -300,6 +300,11 @@ export async function serve({
       ? createDetectionLoop({ state, tern, ...(classify ? { classify } : {}) })
       : null;
   if (detection && detectionEnabled) detection.start();
+  // A state change reaches snapshot.json at once, not on the next ingest (which
+  // may be waiting on a `tern ls`): the rail reads only that file.
+  state.onTransition(() => {
+    persist().catch(() => {});
+  });
   const stopTitles =
     detection && detectionEnabled && typeof tern.events === "function"
       ? followTitles(tern, (pane, title) => detection.noteTitle(pane, title))

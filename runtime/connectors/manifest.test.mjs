@@ -289,8 +289,19 @@ describe("classifySurface omp (tern startup rules only)", () => {
       "                    ↑/↓ select · ⏎ confirm · ⎋ skip · Ctrl+C exit setup",
     ].join("\n"));
     assert.deepEqual([s.state, s.rule, s.visible_blocker], ["blocked", "omp_setup_wizard", true]);
+    // A narrower pane puts the heading and the step on one line (lab verbatim).
+    const narrow = classifySurface("omp", [
+      "                               Setup step 1 of 5",
+      "    Sign in to your providers",
+      "    ╰──────────────────────────────────────────────────────────────────────╯",
+      "              ↑/↓ select · ⏎ confirm · ⎋ skip · Ctrl+C exit setup",
+    ].join("\n"));
+    assert.equal(narrow.rule, "omp_setup_wizard");
   });
-  it("a ready omp screen is idle", () => {
-    assert.equal(classifySurface("omp", " π > ⬢ model > 🗑 scratch\n╰─ \n").state, "idle");
+  it("only omp's own prompt is visible ready evidence; its splash is not (lab verbatim)", () => {
+    const ready = classifySurface("omp", " π > ⬢ no-model > 🗑 scratch > ◫ 7.6K/? ⟲ ▶──────\n──────\n╰─\n  ⇧⇥ to change thinking effort\n");
+    assert.deepEqual([ready.state, ready.rule, ready.visible_idle], ["idle", "omp_prompt_ready", true]);
+    const splash = classifySurface("omp", "   ✧      ·        ✦\n        ████████\n        ██  ██\n   ░░▒▒▓▓██▓▓▒▒░░\n");
+    assert.deepEqual([splash.state, splash.visible_idle], ["idle", false]);
   });
 });

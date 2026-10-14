@@ -156,7 +156,11 @@ export class RuntimeState {
     o.state_change_seq = this._seq;
     let completion = false;
     if (next !== "idle") o.seen = true;
-    if ((prev === "working" || prev === "blocked") && next === "idle" && !o.acq) {
+    // A Claude/Codex still launching (no idle screen yet) finishes no turn: its
+    // startup dialogs are not work (deviation from herdr, measured: a one-read
+    // flicker of `working` between Codex's dialogs ended the acquisition).
+    const launching = o.agent !== "omp" && o.launch_pending;
+    if ((prev === "working" || prev === "blocked") && next === "idle" && !o.acq && !launching) {
       completion = true;
       o.completion_seq = o.state_change_seq;
       o.seen = this._isSeen(o.pane_id, o.tab_id);
@@ -195,9 +199,10 @@ export class RuntimeState {
         o.startup_gate = "blocked";
         next = "blocked";
         message = sc.rule ?? "awaiting input";
-      } else if (sc) {
-        // A startup dialog answered is still the agent's acquisition, never a
-        // finished turn.
+      } else if (sc && sc.state === "idle" && sc.visible_idle) {
+        // omp's own prompt on screen (positive evidence: its splash matches no
+        // rule). A startup dialog answered is still the agent's acquisition,
+        // never a finished turn.
         if (o.startup_gate === "blocked") o.acq = true;
         o.startup_gate = "clear";
         next = o.reported_state ?? o.state;
@@ -287,6 +292,7 @@ export class RuntimeState {
     o.screen = {
       state: d.state,
       visible_blocker: d.visible_blocker === true && d.state === "blocked",
+      visible_idle: d.visible_idle === true && d.state === "idle",
       rule: typeof d.rule === "string" ? d.rule : null,
       at: typeof d.at === "number" ? d.at : this._now(),
     };
