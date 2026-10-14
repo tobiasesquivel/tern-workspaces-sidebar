@@ -1,0 +1,29 @@
+# Tern rules for omp. herdr has no omp manifest: omp reports its whole lifecycle
+# through its extension, and the screen is not read. Tern reads it only while
+# `start` waits, to catch what the extension does not report: a startup dialog.
+id = "tern-omp"
+version = "2026.10.14.1"
+
+# omp 18.10.4 with a fresh agent dir: "Setup step 1 of 5 / Sign in to your
+# providers", footer "↑/↓ select · ⏎ confirm · ⎋ skip · Ctrl+C exit setup" (lab
+# captures; the heading and the step share a line or not, by pane width).
+[[rules]]
+id = "omp_setup_wizard"
+state = "blocked"
+priority = 950
+region = "whole_recent"
+visible_blocker = true
+contains = ["exit setup"]
+line_regex = ['(?i)(?:^|\s)step \d+ of \d+\s*$']
+
+# omp's own prompt: its status line (`π > …`) above the `╰─` editor corner (lab
+# capture). The positive ready evidence, as herdr's codex_prompt_ready is for Codex:
+# omp reports `session_start` while its splash and setup wizard are still on screen,
+# so a screen with no rule matched (the splash) must not count as ready.
+[[rules]]
+id = "omp_prompt_ready"
+state = "idle"
+priority = 100
+region = "whole_recent"
+visible_idle = true
+line_regex = ['^\s*π\s+>\s', '^\s*╰─']

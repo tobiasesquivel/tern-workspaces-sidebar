@@ -7,7 +7,92 @@ local worktrees = require("./worktrees")
 local git = require("./git")
 local group = require("./group")
 
+--- The runtime bridge, compiled by `warmup` on the first read tick: a top-level
+--- `require("./runtime")` would add its compile to the hook that loads this module.
+local runtime: any = nil
+local runtime_warmed = false
+--- Production requires the bridge on the first read tick (`warmup`), never at the top
+--- level; the suites swap in their own through `set_runtime`.
+local runtime_loader: (() -> any)? = function()
+	return require("./runtime")
+end
+
 local model = {}
+
+--- Swaps the loader (a function) or hands the bridge in warm (the suites). True when
+--- newly warm.
+function model.set_runtime(mod: any): boolean
+	local was = runtime_warmed
+	if type(mod) == "function" then
+		runtime_loader = mod
+	else
+		runtime = mod
+		runtime_warmed = mod ~= nil
+	end
+	return not was and runtime_warmed
+end
+
+--- Loads the bridge outside the load hook. True when this tick warmed it (caller
+--- returns before any I/O); false when warm or loaderless.
+function model.warmup(): boolean
+	if runtime_warmed then
+		return false
+	end
+	local load = runtime_loader
+	if load == nil then
+		return false
+	end
+	local ok, mod = pcall(load)
+	if not ok or mod == nil then
+		return false
+	end
+	runtime = mod
+	runtime_warmed = true
+	return true
+end
+
+--- The chime handoff `sound.flush` asks first: true when the daemon took the chime (it
+--- starts the player outside the window), false when there is no warm bridge or no live
+--- daemon, and the sound module plays it itself.
+function model.hand_chime(kind: string): boolean
+	if runtime == nil then
+		return false
+	end
+	return runtime.chime(kind) == true
+end
+
+--- The read tick's daemon `ensure`, through the bridge the model holds: true only when
+--- it really spawned, so the tick spends its one spawn on it. False while the bridge
+--- is not warm yet — the warmup tick does no I/O.
+function model.ensure_runtime(): boolean
+	if runtime == nil then
+		return false
+	end
+	return runtime.ensure() == true
+end
+
+--- The tab holding `pane`. `cx.session:tab_of` answers nil for panes the window lists
+--- (measured: a tab another client created, and one `ctl tab new` opened — `panes()` and
+--- `tabs()` list them with their tab, while `tab_of`, `pane` and `layout` answer nil),
+--- and a nil active tab made the rail focus the session's first tab: a tab switch
+--- bounced straight back. The pane list is the fallback, one scan.
+function model.tab_of(cx: WindowCx, pane: number): number?
+	local tab = cx.session:tab_of(pane)
+	if tab ~= nil then
+		return tab
+	end
+	local ok, panes = pcall(function()
+		return cx.session:panes()
+	end)
+	if ok and panes then
+		for _, p in panes do
+			if p.pane == pane then
+				return p.tab
+			end
+		end
+	end
+	return nil
+end
 
 -- Per-cycle cache; window.luau invalidates at each cycle start / mutation
 local cache_panes: { number } = {}
@@ -17,7 +102,6 @@ function model.invalidate()
 	cache_valid = false
 end
 
--- One canvas:list per cycle; every is_mine/tab_has_sidebar call hits the cache
 function model.mine(cx: WindowCx): { number }
 	if cache_valid then
 		return cache_panes
@@ -46,7 +130,7 @@ end
 -- Checks canvas list AND the tab layout tree (prevents duplicate opens on race)
 function model.tab_has_sidebar(cx: WindowCx, tab_id: number): (boolean, number?)
 	for _, pane in model.mine(cx) do
-		if cx.session:tab_of(pane) == tab_id then
+		if model.tab_of(cx, pane) == tab_id then
 			return true, pane
 		end
 	end
@@ -78,7 +162,7 @@ end
 function model.deduplicate_sidebars(cx: WindowCx)
 	local seen_tab: { [number]: number } = {}
 	for _, pane in model.mine(cx) do
-		local tab = cx.session:tab_of(pane)
+		local tab = model.tab_of(cx, pane)
 		if tab then
 			if seen_tab[tab] then
 				cx.layout:close(pane)
@@ -134,93 +218,179 @@ export type TabFlags = {
 	busy: boolean,
 	waiting: boolean,
 	--- An unseen warning that is not a finished turn: a command or a program that failed
-	--- (`alert`, the `!` badge).
+	--- (the `!` badge).
 	alert: boolean,
-	--- A finished turn nobody has looked at yet: Tern's unseen alert on an agent that is
-	--- back to `idle`. Its own flag and its own badge (the cyan `✓`) because a turn that
-	--- ended well is not a failure — the two used to be the same `!`.
+	--- A finished turn nobody has looked at yet: the daemon's explicit `done`. Its own
+	--- flag and its own badge (the cyan `✓`) because a turn that ended well is not a
+	--- failure — the two used to be the same `!`.
 	done: boolean,
 	is_agent: boolean,
 }
 
---- The agent state last observed, by pane. One map, the single source the tab badges
---- (`flags_from`, through the snapshot) and the chimes (`observe_agents`, through the read
---- tick's poll) both read, so what the rail draws and what it plays can never come from two
---- different ideas of what an agent is doing. Module-level: one rail, one observation. Only
---- `observe_agents` writes it, and a failed read never does (see there).
-local observed: { [number]: string } = {}
+--- The final agent state per pane, as the daemon arbitrated it (`snapshot.json`), by
+--- pane. One map, the single source the tab badges (`flags_from`, through the
+--- snapshot) and the chimes (through the read tick's poll) both read, so what the rail
+--- draws and what it plays can never come from two different ideas of what an agent
+--- is doing. Module-level: one rail, one observation. Only `observe_final` writes
+--- it, and a failed snapshot read never does (see there). A valid empty read — the
+--- daemon answering with no agents — replaces it, so an agent that is gone is
+--- forgotten; a failed one is retried on the next tick — delayed, never missed. A
+--- snapshot gone quiet past `runtime.is_dead` clears this instead of painting a live
+--- rail that is not (see `poll_agents`).
+export type FinalState = { status: string, failed: boolean, done: boolean, id: string?, completion: number? }
 
---- The states a fresh `agents:list()` lists, by pane id. Pure: one loop over the list the
---- caller already read — never a second `agents:list`. Keyed by `pane` and not by `agent`,
---- which is what keeps several agents of one tab apart.
-local function states_of(agents: { any }): { [number]: string }
-	local out: { [number]: string } = {}
-	for _, a in agents do
-		if a.pane then
-			out[a.pane] = a.state
-		end
+--- The map the daemon's snapshot folds into, the contract `runtime.read_snapshot`
+--- hands over. Keys stay the daemon's pane ids: pane ids past 2^32 survive as JSON
+--- numbers end to end and are never truncated on the way here. `id` is the occupant
+--- identity (`terminal_id`), `completion` the daemon's `completion_seq`: together they
+--- tell a new occupant in an old pane apart from the one that left it.
+local observed: { [number]: FinalState } = {}
+
+--- The chime language of one pane's final state: `blocked` is the question mark, the
+--- `done` status the background completion. `unknown` maps to itself and never to a
+--- false `working`.
+local function chime_of(fs: FinalState): string
+	if fs.status == "blocked" then
+		return "waiting_input"
 	end
-	return out
+	if fs.status == "done" then
+		return "idle"
+	end
+	return fs.status
 end
 
---- One agent that moved between two polls: its pane, the state it was in (nil on a first
---- sighting) and the one it is in now, plus whether its pane sits in the tab you are on —
---- the fact the chime rule needs and the model knows.
-export type AgentMove = { pane: number, prev: string?, next: string, active: boolean }
+--- One agent that moved between two polls: its pane, the state it was in (nil on a
+--- first sighting) and the one it is in now, plus whether its pane sits in the tab
+--- you are on — the fact the chime rule needs and the model knows. `done` carries
+--- the daemon's explicit completion flag, so a completion the poll never saw as a
+--- native transition still chimes.
+export type AgentMove = { pane: number, prev: string?, next: string, active: boolean, done: boolean }
 
---- Folds one `agents:list()` answer — as `states_of` folded it under `model.poll_agents` —
---- into the observed state and reports the moves it made. Pure in, moves out: no second
---- `agents:list`, no file, no process. Called only by the poll, never by a paint.
+--- Folds one daemon snapshot — already read once by the poll — into the observed
+--- state and reports the moves it made. Pure in, moves out: no snapshot read, no
+--- second `agents:list`, no file, no process. Called only by the poll, never by a
+--- paint. `panes` is the pane list by id, only to judge which tab each move sits in.
 ---
---- `states == nil` is a read that failed: the state is left exactly as it was, so a
---- transition this poll cannot judge is judged by the next one — delayed, never missed.
---- An unusable pane list is the same case: nothing is replaced, because a move cannot be
---- attributed to a tab without it. A map — even an empty one, the rail with no agents at
---- all — replaces the state, so an agent that is gone is forgotten and a later agent in
---- its pane seeds fresh instead of inheriting the moves of a program it is not.
-function model.observe_agents(
-	states: { [number]: string }?,
+--- `final == nil` is a read that failed: the state is left exactly as it was, so a
+--- transition this poll cannot judge is judged by the next one — delayed, never
+--- missed. A map — even an empty one, the rail with no agents at all — replaces the
+--- state, so an agent that is gone is forgotten and a later agent in its pane seeds
+--- fresh instead of inheriting the moves of a program it is not.
+function model.observe_final(
+	final: { [number]: FinalState }?,
 	panes: { [number]: PaneInfo }?,
 	focused_tab: number?
 ): { AgentMove }
-	if states == nil or panes == nil or next(panes) == nil then
+	if final == nil then
 		return {}
 	end
+	-- Full diff in pane order, so the queue one poll leaves is the same whatever
+	-- order the snapshot came back in (a table walk is not ordered). A pane the
+	-- snapshot no longer names reads as an exit, which chimes nothing.
+	local seen: { [number]: boolean } = {}
+	for pane in final do
+		seen[pane] = true
+	end
+	for pane in observed do
+		seen[pane] = true
+	end
+	local ordered: { number } = {}
+	for pane in seen do
+		table.insert(ordered, pane)
+	end
+	table.sort(ordered)
 	local moves: { AgentMove } = {}
-	for pane, state in states do
+	for _, pane in ordered do
+		local fs = final[pane]
 		local prev = observed[pane]
-		if prev ~= state then
-			local info = panes[pane]
+		-- A new occupant in an old pane is a first sighting, not a transition: the
+		-- release may have cleared the snapshot between two polls, so the poll never
+		-- saw the exit — without this, a new `working` agent inherits the old
+		-- occupant's `done` edge and chimes false. Same pane, different `terminal_id`
+		-- reads as unseen before. But the same occupant finishing two quick turns
+		-- with no `working` snapshot in between must chime twice: a bigger valid
+		-- `completion_seq` is a fresh completion even when `done` never cleared.
+		local same_occupant = prev ~= nil
+			and fs ~= nil
+			and prev.id ~= nil
+			and fs.id ~= nil
+			and prev.id == fs.id
+		local prev_state: string? = if prev == nil or not same_occupant then nil else chime_of(prev)
+		local next_state: string? = if fs == nil then nil else chime_of(fs)
+		local done_now = fs ~= nil and fs.done
+		local completion_now: number? = if fs ~= nil then fs.completion else nil
+		local completion_before: number? = if prev ~= nil and same_occupant then prev.completion else nil
+		local completion_advanced = same_occupant
+			and type(completion_now) == "number"
+			and type(completion_before) == "number"
+			and (completion_now :: number) > (completion_before :: number)
+		local fresh_done = (done_now and not (prev ~= nil and prev.done and same_occupant))
+			or (done_now and completion_advanced)
+		if prev_state ~= next_state or fresh_done then
+			local info = if panes ~= nil then panes[pane] else nil
 			table.insert(moves, {
 				pane = pane,
-				prev = prev,
-				next = state,
+				prev = prev_state,
+				next = if next_state == nil then "exited" else next_state,
 				active = info ~= nil and info.tab ~= nil and info.tab == focused_tab,
+				done = fresh_done,
 			})
 		end
 	end
-	-- By pane, so the queue one poll leaves is the same whatever order the read came back
-	-- in (a table walk is not ordered).
-	table.sort(moves, function(a: AgentMove, b: AgentMove): boolean
-		return a.pane < b.pane
-	end)
-	observed = states
+	observed = {}
+	for pane, fs in final do
+		observed[pane] = fs
+	end
 	return moves
 end
 
---- The state the poll observed for one pane, or nil when it has seen no agent there. The
---- pane-level view of the same cache the badges read per tab: a consumer that needs one pane
---- — the attention jump — looks it up here instead of reading `agents:list` again.
-function model.observed_agent(pane: number): string?
-	return observed[pane]
+--- Empties the observed state without reporting moves: the snapshot gone quiet past
+--- `runtime.is_dead`, so the rail stops painting a cache the daemon no longer feeds.
+--- The next live snapshot seeds fresh — first sightings, silent — instead of
+--- inheriting the moves of agents it never saw.
+function model.clear_observed()
+	observed = {}
 end
 
---- Per-tab status badges from panes + agent states (keyed by AgentBlock.pane, NOT
---- .agent). Pure: both reads arrive as arguments, so one snapshot builds the flags
---- once for the fingerprint and for the draw.
-function model.flags_from(panes: { PaneInfo }, agents: { [number]: string }?): { [number]: TabFlags }
+--- The state the poll observed for one pane, or nil when it has seen no agent
+--- there, in the chime language (`blocked` reads as `waiting_input`). The
+--- pane-level view of the same cache the badges read per tab: a consumer that needs
+--- one pane — the attention jump — looks it up here instead of reading
+--- `agents:list` again.
+function model.observed_agent(pane: number): string?
+	local fs = observed[pane]
+	if fs == nil then
+		return nil
+	end
+	return chime_of(fs)
+end
+
+--- Whether the daemon marked this pane's turn done and unseen: the `done` status,
+--- without which no badge may claim a finished turn.
+function model.observed_done(pane: number): boolean
+	local fs = observed[pane]
+	return fs ~= nil and fs.done
+end
+
+--- Whether the daemon kept this pane's failure flag while the agent lives.
+function model.observed_failed(pane: number): boolean
+	local fs = observed[pane]
+	return fs ~= nil and fs.failed
+end
+
+--- Per-tab status badges from panes + final agent states (keyed by pane, NOT agent).
+--- Pure: both reads arrive as arguments, so one snapshot builds the flags once for
+--- the fingerprint and for the draw. `agents` is the poll's observed map; nil reads
+--- as no agent anywhere, never as a failure.
+---
+--- The flag chain, in order: `working` → `◐`; `blocked` → `?`; the daemon's `done`
+--- status (a finished turn nobody has looked at) → the cyan `✓` — outside
+--- `pane.alert`, because the completion is the daemon's own state, not Tern's; the
+--- daemon's `failed` (kept while the agent lives) or an unseen pane failure →
+--- the red `!`; `unknown` paints nothing — never a false `working`.
+function model.flags_from(panes: { PaneInfo }, agents: { [number]: FinalState }?): { [number]: TabFlags }
 	local out: { [number]: TabFlags } = {}
-	local agent_map: { [number]: string } = agents or {}
+	local agent_map: { [number]: FinalState } = agents or {}
 
 	for _, p in panes do
 		if p.tab then
@@ -229,35 +399,36 @@ function model.flags_from(panes: { PaneInfo }, agents: { [number]: string }?): {
 				tf = { busy = false, waiting = false, alert = false, done = false, is_agent = false }
 				out[p.tab] = tf
 			end
-			local ag_state = agent_map[p.pane]
-			if ag_state ~= nil then
-				-- The pane HAS an agent, so its state is the truth about the work. `busy` and
-				-- `running` are the agent's own program: an `omp` between turns keeps
-				-- `running = {line = "omp", ms = …}` (measured: `state = "idle"` with
-				-- `running` set on every idle agent block), and OR-ing that in handed an idle
-				-- agent the `◐` badge forever. The two pane signals stay as the fallback for
-				-- the panes that have no agent entry — a shell running a long command still
-				-- paints `◐` (see research/agent-states.md §10.3).
-				if ag_state == "working" then
+			local fs = agent_map[p.pane]
+			if fs ~= nil then
+				-- The pane HAS a final state, so that state is the truth about the
+				-- work. `busy` and `running` are the agent's own program: an `omp`
+				-- between turns keeps `running = {line = "omp", ms = …}` (measured:
+				-- `state = "idle"` with `running` set on every idle agent block),
+				-- and OR-ing that in handed an idle agent the `◐` badge forever. The
+				-- two pane signals stay as the fallback for the panes that have no
+				-- final entry — a shell running a long command still paints `◐` (see
+				-- research/agent-states.md §10.3).
+				if fs.status == "working" then
 					tf.busy = true
 				end
 			elseif p.busy or p.running ~= nil then
 				tf.busy = true
 			end
-			if ag_state == "waiting_input" then
+			if fs ~= nil and fs.status == "blocked" then
 				tf.waiting = true
 			end
-			-- `pane.alert` is Tern's own "you have not seen this": it is raised when an agent
-			-- stops in a pane you are not looking at, and cleared when the pane is focused.
-			-- One flag, two very different things, told apart by what the agent is now: an
-			-- agent back to `idle` finished its turn (`done`, the cyan `✓`), while a non-zero
-			-- `last.status` — a command or a program that failed — is an error (`alert`, the
-			-- red `!` as before). A pane the agent list has no entry for keeps the old
-			-- reading at the pane level: an unseen alert with nothing to explain it is an
-			-- alert, and so is an agent that is not idle (`exited`, or a question that the
-			-- `waiting` branch paints first).
-			local failed = p.last ~= nil and p.last.status ~= 0
-			if p.alert and not failed and ag_state == "idle" then
+			-- A finished turn is the daemon's own state: the `done` status nobody has
+			-- looked at yet is the cyan `✓`, never the red `!`. A failure is the
+			-- daemon's `failed` (kept while the agent lives) for a pane it has an entry
+			-- for — the pane's `last.status` there is the shell's command from before
+			-- the agent started, nothing the agent did — and a non-zero `last.status`
+			-- only for a pane it has none for. Tern's own unseen `pane.alert` keeps
+			-- the old reading at the pane level: an unseen alert with no finished turn
+			-- to explain it is an alert.
+			local failed = if fs ~= nil then fs.failed else (p.last ~= nil and p.last.status ~= 0)
+			local done_here = fs ~= nil and fs.done
+			if done_here and not failed then
 				tf.done = true
 			elseif p.alert or failed then
 				tf.alert = true
@@ -337,7 +508,7 @@ end
 
 --- The same, starting the read when the cache is cold or stale. For user actions —
 --- menus and the worktree flows — where "not a git checkout" must never be guessed.
---- Never call it from a draw: one cold `git rev-parse` can cost a whole call budget.
+--- Never call it from a draw: a cold read walks the disk, and a draw does no I/O.
 function model.worktree_live(cx: WindowCx, session_id: number): worktrees.Info?
 	local cwd = model.session_cwd(cx, session_id)
 	if not cwd then
@@ -346,23 +517,49 @@ function model.worktree_live(cx: WindowCx, session_id: number): worktrees.Info?
 	return worktrees.info_for(cwd)
 end
 
---- The one place the plugin reads the agents: the read tick's poll. Reads the window's
---- agent list, its panes and its focused tab, folds the list into per-pane states and hands
---- them to `observe_agents`, which folds them into the single observed state and returns the
---- moves. It never draws: the paint reads that same observed state (see `snapshot`), which
---- is why a question cannot be shown before it has been heard. Returns the moves, for the
---- read tick to hand to `sound.observe` in the same invocation.
+--- The one place the plugin reads the agents: the read tick's poll. Reads the
+--- window's agent list once — the publication input, never drawn — publishes it for
+--- the daemon (`runtime.publish`), then folds the daemon's single snapshot read into
+--- the observed state and returns the moves. It never draws: the paint reads that
+--- same observed state (see `snapshot`), which is why a question cannot be shown
+--- before it has been heard. Returns the moves, for the read tick to hand to
+--- `sound.observe` in the same invocation. The focused tab the tick is on is both
+--- published and used to judge the moves (`active`), even with the rail unmounted:
+--- focus is the window's, not the rail's. All file I/O is bounded in pcall: a read
+--- that fails keeps the cache — except a snapshot gone quiet past `runtime.is_dead`,
+--- which clears it instead of painting a live rail that is not.
 function model.poll_agents(cx: WindowCx): { AgentMove }
+	-- Warmup tick: compile the bridge and nothing else. The load hook cannot afford
+	-- compile+I/O in one 50 ms budget, so this tick pays the compile and returns
+	-- before any agents/list, fs, git or audio. No bridge at all (a view-only world
+	-- whose harness never injected one) folds nothing either — same return, no I/O.
+	if model.warmup() or runtime == nil then
+		return {}
+	end
 	local ok_ag, agents = pcall(function()
 		return cx.agents:list()
+	end)
+	local ok_tabs, tabs = pcall(function()
+		return cx.session:tabs()
 	end)
 	local ok_p, panes = pcall(function()
 		return cx.session:panes()
 	end)
-	local states: { [number]: string }? = if ok_ag and agents then states_of(agents) else nil
+	local pane_list: { PaneInfo } = if ok_p and panes then panes else {}
+	local tab_list: { TabInfo }? = if ok_tabs and tabs then tabs else nil
 	local focused_pane = cx.session:focused()
-	local focused_tab = if focused_pane then cx.session:tab_of(focused_pane) else nil
-	return model.observe_agents(states, panes_by_id(if ok_p and panes then panes else {}), focused_tab)
+	local focused_tab = if focused_pane then model.tab_of(cx, focused_pane) else nil
+	-- Tern's pane ids are per client: map the daemon's to this window's before the
+	-- observation goes out in the daemon's ids and the snapshot comes in as ours.
+	pcall(runtime.sync_ids, cx)
+	pcall(runtime.publish, if ok_ag and agents then agents else nil, pane_list, tab_list, focused_pane, focused_tab)
+	local ok_snap, snap = pcall(runtime.read_snapshot, cx)
+	local final: { [number]: FinalState }? = if ok_snap and snap then snap.states else nil
+	if final == nil and runtime.is_dead() then
+		model.clear_observed()
+		return {}
+	end
+	return model.observe_final(final, panes_by_id(pane_list), focused_tab)
 end
 
 -- The rail's rows: the session list in order, with each repo's worktrees nested under
@@ -430,13 +627,46 @@ export type Snapshot = {
 	focused_tab: number?,
 }
 
+--- The tabs as the rail labels them: a tab whose focused block is the rail itself (a
+--- press on the rail focuses it until the keyboard is handed back) is described by its
+--- terminal instead. Tern describes a tab by its focused block, so for that moment the tab
+--- read `Workspaces` with no cwd: its row changed label and every rail was redrawn twice
+--- per click (measured in the lab).
+function model.tabs_by_terminal(tabs: { TabInfo }, panes: { PaneInfo }, rails: { number }): { TabInfo }
+	local is_rail: { [number]: boolean } = {}
+	for _, p in rails do
+		is_rail[p] = true
+	end
+	local out: { TabInfo }? = nil
+	for i, t in tabs do
+		if is_rail[t.pane] then
+			for _, p in panes do
+				if p.tab == t.id and not is_rail[p.pane] then
+					if out == nil then
+						out = table.clone(tabs)
+					end
+					local copy = table.clone(t)
+					copy.pane = p.pane
+					copy.title = p.title
+					copy.cwd = p.cwd
+					copy.program = p.program or copy.program
+					local o = out :: { TabInfo }
+					o[i] = copy
+					break
+				end
+			end
+		end
+	end
+	return out or tabs
+end
+
 function model.snapshot(cx: WindowCx): Snapshot
 	local sessions = cx.sessions:list()
-	local tabs = cx.session:tabs()
 	local ok_p, panes = pcall(function()
 		return cx.session:panes()
 	end)
 	local pane_list: { PaneInfo } = if ok_p and panes then panes else {}
+	local tabs = model.tabs_by_terminal(cx.session:tabs(), pane_list, model.mine(cx))
 
 	local current = 0
 	for _, s in sessions do
@@ -446,7 +676,7 @@ function model.snapshot(cx: WindowCx): Snapshot
 	end
 
 	local focused_pane = cx.session:focused()
-	local focused_tab = if focused_pane then cx.session:tab_of(focused_pane) else nil
+	local focused_tab = if focused_pane then model.tab_of(cx, focused_pane) else nil
 
 	local wt: { [number]: worktrees.Info? } = {}
 	local head: { [number]: worktrees.Head? } = {}
@@ -478,12 +708,51 @@ function model.snapshot(cx: WindowCx): Snapshot
 	}
 end
 
+--- The snapshot as the rail mounted in `tab_id` must show it: that tab focused and its
+--- session current. Each tab has its own rail, and the one you switch to is on screen before
+--- any hook can repaint it, so every rail is drawn ahead as seen from its own tab: the switch
+--- then finds it already right (measured: a shared tree left the new tab's rail marking the
+--- old tab for a frame after a click, and up to half a second after a keyboard switch).
+--- A tab the snapshot does not list keeps the snapshot as it is. Shallow: the tables it
+--- does not touch are the snapshot's own.
+function model.seen_from(snap: Snapshot, tab_id: number?): Snapshot
+	local sid: number? = nil
+	for _, t in snap.tabs do
+		if t.id == tab_id then
+			sid = t.session
+			break
+		end
+	end
+	if sid == nil then
+		return snap
+	end
+	if sid == snap.current and tab_id == snap.focused_tab then
+		return snap
+	end
+	local sessions: { ManagedSession } = snap.sessions
+	local folded = snap.folded
+	if sid ~= snap.current then
+		sessions = {}
+		for _, s in snap.sessions do
+			local copy = table.clone(s)
+			copy.current = s.id == sid
+			table.insert(sessions, copy)
+		end
+		folded = model.fold_rows(snap.rows, sid)
+	end
+	local out = table.clone(snap)
+	out.sessions = sessions
+	out.current = sid
+	out.folded = folded
+	out.focused_tab = tab_id
+	return out
+end
+
 --- What the poll reads next: one stale checkout at a time, then one stale ahead/behind
 --- per repo. Peek-only — the caller starts the read — and nil when everything is fresh.
 ---
---- One per tick is what keeps every window call inside its budget: a cold
---- `git rev-parse` alone can cost a good part of the 50 ms, and asking for seven of
---- them in one call is what used to trip the hook and freeze the whole rail.
+--- One per tick is what keeps every window call inside its budget: asking for seven
+--- reads in one call is what used to trip the hook and freeze the whole rail.
 export type Read = { cwd: string } | { root: string }
 
 function model.next_read(cx: WindowCx): Read?
