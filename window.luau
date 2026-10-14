@@ -54,7 +54,8 @@ end)
 local TITLE = "Workspaces"
 local HOME = tern.getenv("HOME") or ""
 local opening = false
-local last_fp: string?
+--- The fingerprint each rail was last drawn with, by pane.
+local painted: { [number]: string } = {}
 local tab_opening_times: { [number]: number } = {}
 
 local function mine(cx: WindowCx): { number }
@@ -69,6 +70,17 @@ end
 -- That is what keeps a paint from consuming a move the chime still owes you, and what
 -- lets the rail be unmounted without muting anything. A repaint therefore fits the 50 ms
 -- window budget no matter how many sessions the rail lists.
+--
+-- Every tab has its own rail, and each is drawn as seen from its own tab (`model.seen_from`):
+-- its tab focused, its session current. The rail of the tab you switch to is on screen
+-- before any hook runs, so it has to be right already; a switch then repaints nothing.
+-- Each rail keeps its own fingerprint (`painted`). The rail on screen goes first; the
+-- others follow while the call stays under PAINT_SLICE_MS, and the rest wait for the
+-- next paint tick (they are not on screen).
+local PAINT_SLICE_MS = 20
+--- When the running hook started: the slice and the mount ahead are measured from it, so
+--- one hook's mount, sync and repaint share its 50 ms instead of each taking a slice.
+local hook_started = 0
 local function refresh(cx: WindowCx)
 	local panes = mine(cx)
 	if #panes == 0 then
@@ -79,21 +91,43 @@ local function refresh(cx: WindowCx)
 		pcall(tern.log.warn, "ws snapshot failed: " .. tostring(snap))
 		return
 	end
-	local fp = view_mod.fingerprint(snap)
-	if fp == last_fp then
-		return
-	end
-	last_fp = fp
-	local ok, v = pcall(view_mod.build, snap)
-	if not ok or not v then
-		pcall(tern.log.warn, "ws view.build failed: " .. tostring(v))
-		return
-	end
+	local order: { { pane: number, tab: number? } } = {}
 	for _, pane in panes do
-		cx.canvas:set(pane, { view = v })
+		local tab = model.tab_of(cx, pane)
+		if tab ~= nil and tab == snap.focused_tab then
+			table.insert(order, 1, { pane = pane, tab = tab })
+		else
+			table.insert(order, { pane = pane, tab = tab })
+		end
+	end
+	local live: { [number]: boolean } = {}
+	for i, item in order do
+		live[item.pane] = true
+		if i > 1 and tern.now() - hook_started > PAINT_SLICE_MS then
+			continue
+		end
+		local seen = model.seen_from(snap, item.tab)
+		local fp = view_mod.fingerprint(seen)
+		if painted[item.pane] ~= fp then
+			local ok, v = pcall(view_mod.build, seen)
+			if not ok or not v then
+				pcall(tern.log.warn, "ws view.build failed: " .. tostring(v))
+				return
+			end
+			cx.canvas:set(item.pane, { view = v })
+			painted[item.pane] = fp
+		end
+	end
+	for pane in painted do
+		if not live[pane] then
+			painted[pane] = nil
+		end
 	end
 end
 
+--- Mount a rail in `tab_id`, already drawn as seen from that tab, on the left of the tab's
+--- terminal and at the shared width. The tab may be one the window is not showing: the
+--- paint tick mounts rails ahead (`premount`), so a visit never finds a tab without one.
 local function open(cx: WindowCx, tab_id: number, focus: boolean)
 	if opening then
 		return
@@ -107,26 +141,81 @@ local function open(cx: WindowCx, tab_id: number, focus: boolean)
 
 	opening = true
 	pcall(function()
-		local active_tab = if cx.session:focused() then model.tab_of(cx, cx.session:focused()) else nil
-		local target = layout_mod.find_tab_terminal(cx, model.is_mine, tab_id) or cx.session:focused()
+		local focused = cx.session:focused()
+		local active_tab = if focused then model.tab_of(cx, focused) else nil
+		local target = layout_mod.find_tab_terminal(cx, model.is_mine, tab_id)
+		if not target and active_tab == tab_id then
+			target = focused
+		end
+		if not target then
+			-- A tab with nothing but a rail would be closed as empty: mount none.
+			return
+		end
 		local pane, _err = cx.canvas:open({
 			title = TITLE,
 			about = "Workspaces Sidebar. Click a workspace to fold it, a tab to focus it, ⋯ for the menu. Hide closes the sidebar; Ctrl+Alt+B brings it back.",
-			view = view_mod.build(model.snapshot(cx)),
+			view = view_mod.build(model.seen_from(model.snapshot(cx), tab_id)),
 			how = "beside",
 			focus = focus,
 		})
 		if pane then
 			model.invalidate()
-			if active_tab == tab_id and target then
-				cx.layout:move(pane, target, "left", { focus = false })
-				layout_mod.match_ratio(cx, model.is_mine, pane, tab_id, layout_mod.target_ratio())
-			else
+			-- Straight to the left of the tab's terminal, whichever tab that is.
+			local moved = cx.layout:move(pane, target, "left", { focus = false })
+			if not moved and active_tab ~= tab_id then
 				cx.layout:move_to_tab(pane, tab_id, { focus = false })
 			end
+			if active_tab ~= tab_id then
+				-- The pane moved into a tab becomes that tab's focused block, so the rail
+				-- would be: the tab's title would read `Workspaces` and the visit would land
+				-- the keyboard on the rail. Moving the terminal back beside the rail hands the
+				-- tab's focus to it, with no focus call (which would show that tab, and clear
+				-- the alert of a terminal nobody looked at).
+				cx.layout:move(target, pane, "right", { focus = false })
+			end
+			layout_mod.match_ratio(cx, model.is_mine, pane, tab_id, layout_mod.target_ratio())
 		end
 	end)
 	opening = false
+end
+
+--- Mount the rail of one tab that has none yet, off the click's path: the tabs of the
+--- current session first, then the others. One per call (the paint tick calls it), and only
+--- in tabs Tern can lay out and that hold a terminal. Measured without it: the first visit to
+--- a tab showed the terminal full width, then the rail sliding in (~270 ms).
+local function premount(cx: WindowCx)
+	if opening or not tern.kv.get("pinned") then
+		return
+	end
+	-- A mount costs a build, an open, a move and a few resizes: only in a hook that has
+	-- most of its budget left. The next tick tries again.
+	if tern.now() - hook_started > 10 then
+		return
+	end
+	local has: { [number]: boolean } = {}
+	for _, p in mine(cx) do
+		local t = model.tab_of(cx, p)
+		if t then
+			has[t] = true
+		end
+	end
+	local cur = cx.sessions:current().id
+	local now = tern.now()
+	local tabs = cx.session:tabs()
+	for pass = 1, 2 do
+		for _, t in tabs do
+			if not has[t.id] and ((pass == 1) == (t.session == cur)) then
+				local last = tab_opening_times[t.id]
+				if (last == nil or now - last >= 1200)
+					and cx.session:layout(t.id) ~= nil
+					and layout_mod.find_tab_terminal(cx, model.is_mine, t.id) ~= nil
+				then
+					open(cx, t.id, false)
+					return
+				end
+			end
+		end
+	end
 end
 
 -- Ensures active tab in shown workspace has the sidebar mounted and synced
@@ -251,7 +340,7 @@ end
 
 local function after_change(cx: WindowCx)
 	model.invalidate()
-	last_fp = nil
+	painted = {}
 	pcall(ensure_pinned, cx)
 	pcall(refresh, cx)
 end
@@ -444,7 +533,7 @@ local function toggle_sidebar(cx: WindowCx)
 	else
 		tern.kv.set("pinned", true)
 		opening = false
-		last_fp = nil
+		painted = {}
 		ensure_pinned(cx)
 		refresh(cx)
 	end
@@ -460,7 +549,7 @@ tern.command({
 tern.command({ id = "new", title = "Workspaces: new", icon = "plus", run = function(cx)
 	local cwd, name = current_context(cx)
 	cx.sessions:create({ name = name, cwd = cwd })
-	last_fp = nil
+	painted = {}
 	pcall(ensure_pinned, cx)
 	pcall(refresh, cx)
 end })
@@ -481,7 +570,7 @@ tern.command({
 		local next_style = if cur == "smart" then "fish" else "smart"
 		tern.kv.set("path_style", next_style)
 		cx:toast("info", "Path style: " .. next_style)
-		last_fp = nil
+		painted = {}
 		refresh(cx)
 	end,
 })
@@ -505,7 +594,7 @@ tern.command({
 			cx.layout:color_tab(tab_id, next_c)
 			tern.kv.set("tab_color_" .. tab_id, next_c)
 			cx:toast("info", "Tab color: " .. (next_c or "none"))
-			last_fp = nil
+			painted = {}
 			refresh(cx)
 		end
 	end,
@@ -535,7 +624,7 @@ tern.command({
 				end
 			end
 		end
-		last_fp = nil
+		painted = {}
 		refresh(cx)
 	end,
 })
@@ -548,7 +637,7 @@ tern.command({
 		local next_val = if cur == false then true else false
 		tern.kv.set("color_labels_enabled", next_val)
 		cx:toast("info", "Color tag labels: " .. (if next_val then "ON" else "OFF"))
-		last_fp = nil
+		painted = {}
 		refresh(cx)
 	end,
 })
@@ -596,7 +685,6 @@ for i = 1, 9 do
 			local list = cx.sessions:list()
 			if #list >= i then
 				cx.sessions:switch(list[i].id)
-				last_fp = nil
 				refresh(cx)
 			end
 		end,
@@ -613,7 +701,7 @@ tern.bind("esc", function(cx: WindowCx)
 	if tern.kv.get("moving_tab") then
 		tern.kv.set("moving_tab", nil)
 		cx:toast("info", "Move cancelled")
-		last_fp = nil
+		painted = {}
 		refresh(cx)
 	end
 end)
@@ -733,9 +821,49 @@ local function menu_for_tab(cx: WindowCx, tid: number)
 	run_menu(cx, items, "Tab actions", "tabs-h")
 end
 
+--- Hand the keyboard back to the terminal of the canvas' own tab.
+---
+--- A press inside the rail lands on the canvas pane, and Tern focuses the pane it was
+--- clicked in before it dispatches the click: the tab then wears the canvas' header
+--- title (`Workspaces`) and the keyboard sits in a pane that never types. The rail only
+--- answers clicks, so a canvas that took the focus gives it back to the terminal beside
+--- it — the pane the user was typing in.
+---
+--- This runs from the focus event because that is the one place every click of the rail
+--- passes through: a row with an action, the padding between rows and a press the user
+--- holds without releasing all steal the focus, and only the first of them ever reaches
+--- canvas_action.
+local function refocus_terminal(ev: any, cx: WindowCx)
+	local pane = ev and ev.pane
+	if not pane or not model.is_mine(cx, pane) then
+		return
+	end
+	-- A focus event of the rail that arrives after the keyboard already moved on (a click
+	-- that switched tabs) hands nothing back: doing so would pull the window back to the
+	-- tab the click came from.
+	local now_focused = cx.session:focused()
+	if now_focused ~= nil and now_focused ~= pane then
+		return
+	end
+	local tab = ev.tab or model.tab_of(cx, pane)
+	local term = if tab then layout_mod.find_tab_terminal(cx, model.is_mine, tab) else nil
+	if term then
+		cx.layout:focus(term)
+	end
+end
+
 canvas_action = function(ev: CanvasAction, cx: WindowCx): boolean?
 	if ev.owner ~= tern.plugin.id then
 		return nil
+	end
+	hook_started = tern.now()
+	-- The press focused the rail before this click arrived. Hand the rail's own tab back to
+	-- its terminal now, before any switch: once the click moves to another tab, the rail's
+	-- focus event never does it, and that tab keeps the rail focused (its title reads
+	-- `Workspaces` and going back puts the keyboard on the rail).
+	local origin = if ev.pane ~= nil and ev.pane ~= 0 then ev.pane else cx.session:focused()
+	if origin ~= nil then
+		pcall(refocus_terminal, { pane = origin }, cx)
 	end
 	local kind, id = string.match(ev.act, "^([%a_]+):?(%d*)$")
 	local n = tonumber(id)
@@ -743,7 +871,7 @@ canvas_action = function(ev: CanvasAction, cx: WindowCx): boolean?
 	-- Cancel move mode via badge click
 	if kind == "cancel_move" then
 		tern.kv.set("moving_tab", nil)
-		last_fp = nil
+		painted = {}
 		refresh(cx)
 		return true
 	end
@@ -772,12 +900,12 @@ canvas_action = function(ev: CanvasAction, cx: WindowCx): boolean?
 		if my_pos then
 			if held["shift"] and my_pos > 1 then
 				cx.layout:order_tab(n, my_pos - 1)
-				last_fp = nil
+				painted = {}
 				refresh(cx)
 				return true
 			elseif held["alt"] then
 				cx.layout:order_tab(n, my_pos + 1)
-				last_fp = nil
+				painted = {}
 				refresh(cx)
 				return true
 			end
@@ -829,7 +957,7 @@ canvas_action = function(ev: CanvasAction, cx: WindowCx): boolean?
 		cx:prompt({ value = cur_title, placeholder = "Tab name", icon = "pen" }):next(function(text: string?, _err: any, cx2: WindowCx?)
 			if text and text ~= "" and cx2 then
 				cx2.layout:name_tab(n, text)
-				last_fp = nil
+				painted = {}
 				pcall(refresh, cx2)
 			end
 		end)
@@ -868,7 +996,7 @@ canvas_action = function(ev: CanvasAction, cx: WindowCx): boolean?
 						cx2.layout:move_to_new_tab(p, dest, { focus = false })
 					end
 				end
-				last_fp = nil
+				painted = {}
 				pcall(refresh, cx2)
 			end
 		end)
@@ -1014,8 +1142,8 @@ canvas_action = function(ev: CanvasAction, cx: WindowCx): boolean?
 		return nil
 	end
 
+	-- No forced repaint: the fingerprints say which rails the click changed.
 	model.invalidate()
-	last_fp = nil
 	refresh(cx)
 	return true
 end
@@ -1098,6 +1226,14 @@ local function model_warm(): boolean
 end
 local rail_warm = false
 
+--- A hook that came close to its budget says so in tern.log, with its time.
+local function slow(what: string)
+	local spent = tern.now() - hook_started
+	if spent > 30 then
+		pcall(tern.log.warn, "ws slow " .. what .. ": " .. tostring(math.floor(spent)) .. " ms")
+	end
+end
+
 --- Paint tick: the cheap passes and the redraw, all from the caches the read ticks fill.
 --- It never starts a read (`model.next_read` belongs to `read_tick`), never spawns a
 --- process, and therefore stays cheap no matter how slow git is being.
@@ -1116,9 +1252,12 @@ local function paint_tick(cx: WindowCx?)
 	if not cx then
 		return
 	end
+	hook_started = tern.now()
 	model.invalidate()
 	pcall(model.auto_close_empty_tabs, cx)
 	pcall(ensure_pinned, cx)
+	-- One rail mounted ahead in a tab that has none, so no visit finds it missing.
+	pcall(premount, cx)
 
 	-- Update the chrome snapshot for the pure status formatter
 	local ok, cur = pcall(function() return cx.sessions:current() end)
@@ -1129,34 +1268,11 @@ local function paint_tick(cx: WindowCx?)
 	end
 
 	pcall(refresh, cx)
+	slow("paint")
 end
 
 tern.timer(100, read_tick)
 tern.timer(225, paint_tick)
-
---- Hand the keyboard back to the terminal of the canvas' own tab.
----
---- A press inside the rail lands on the canvas pane, and Tern focuses the pane it was
---- clicked in before it dispatches the click: the tab then wears the canvas' header
---- title (`Workspaces`) and the keyboard sits in a pane that never types. The rail only
---- answers clicks, so a canvas that took the focus gives it back to the terminal beside
---- it — the pane the user was typing in.
----
---- This runs from the focus event because that is the one place every click of the rail
---- passes through: a row with an action, the padding between rows and a press the user
---- holds without releasing all steal the focus, and only the first of them ever reaches
---- canvas_action.
-local function refocus_terminal(ev: any, cx: WindowCx)
-	local pane = ev and ev.pane
-	if not pane or not model.is_mine(cx, pane) then
-		return
-	end
-	local tab = ev.tab or model.tab_of(cx, pane)
-	local term = if tab then layout_mod.find_tab_terminal(cx, model.is_mine, tab) else nil
-	if term then
-		cx.layout:focus(term)
-	end
-end
 
 --- One window event's worth of work: mount/sync the rail on the tab the window is on now,
 --- then repaint from the caches. Git reads belong to the read tick — a hook that starts one
@@ -1164,10 +1280,19 @@ end
 --- also stops answering clicks. Every handler below goes through here, which is why losing
 --- this function once broke the rail on every tab switch without breaking the ticks.
 local function on_window_change(cx: WindowCx)
-	last_fp = nil
+	-- Before the paint tick has compiled the rail's modules, a window event would pay that
+	-- compile and a whole build in one hook (measured: `window_start` passed 50 ms on a cold
+	-- window and was disabled). The paint tick mounts and draws a moment later.
+	if not rail_warm then
+		return
+	end
+	hook_started = tern.now()
+	-- No forced repaint: each rail's fingerprint says whether it changed, and a switch
+	-- between tabs changes none (each rail already shows its own tab).
 	model.invalidate()
 	pcall(ensure_pinned, cx)
 	pcall(refresh, cx)
+	slow("window event")
 end
 
 tern.on("window_start", function(cx: WindowCx)

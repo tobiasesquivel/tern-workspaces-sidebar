@@ -627,13 +627,46 @@ export type Snapshot = {
 	focused_tab: number?,
 }
 
+--- The tabs as the rail labels them: a tab whose focused block is the rail itself (a
+--- press on the rail focuses it until the keyboard is handed back) is described by its
+--- terminal instead. Tern describes a tab by its focused block, so for that moment the tab
+--- read `Workspaces` with no cwd: its row changed label and every rail was redrawn twice
+--- per click (measured in the lab).
+function model.tabs_by_terminal(tabs: { TabInfo }, panes: { PaneInfo }, rails: { number }): { TabInfo }
+	local is_rail: { [number]: boolean } = {}
+	for _, p in rails do
+		is_rail[p] = true
+	end
+	local out: { TabInfo }? = nil
+	for i, t in tabs do
+		if is_rail[t.pane] then
+			for _, p in panes do
+				if p.tab == t.id and not is_rail[p.pane] then
+					if out == nil then
+						out = table.clone(tabs)
+					end
+					local copy = table.clone(t)
+					copy.pane = p.pane
+					copy.title = p.title
+					copy.cwd = p.cwd
+					copy.program = p.program or copy.program
+					local o = out :: { TabInfo }
+					o[i] = copy
+					break
+				end
+			end
+		end
+	end
+	return out or tabs
+end
+
 function model.snapshot(cx: WindowCx): Snapshot
 	local sessions = cx.sessions:list()
-	local tabs = cx.session:tabs()
 	local ok_p, panes = pcall(function()
 		return cx.session:panes()
 	end)
 	local pane_list: { PaneInfo } = if ok_p and panes then panes else {}
+	local tabs = model.tabs_by_terminal(cx.session:tabs(), pane_list, model.mine(cx))
 
 	local current = 0
 	for _, s in sessions do
@@ -673,6 +706,46 @@ function model.snapshot(cx: WindowCx): Snapshot
 		head = head,
 		focused_tab = focused_tab,
 	}
+end
+
+--- The snapshot as the rail mounted in `tab_id` must show it: that tab focused and its
+--- session current. Each tab has its own rail, and the one you switch to is on screen before
+--- any hook can repaint it, so every rail is drawn ahead as seen from its own tab: the switch
+--- then finds it already right (measured: a shared tree left the new tab's rail marking the
+--- old tab for a frame after a click, and up to half a second after a keyboard switch).
+--- A tab the snapshot does not list keeps the snapshot as it is. Shallow: the tables it
+--- does not touch are the snapshot's own.
+function model.seen_from(snap: Snapshot, tab_id: number?): Snapshot
+	local sid: number? = nil
+	for _, t in snap.tabs do
+		if t.id == tab_id then
+			sid = t.session
+			break
+		end
+	end
+	if sid == nil then
+		return snap
+	end
+	if sid == snap.current and tab_id == snap.focused_tab then
+		return snap
+	end
+	local sessions: { ManagedSession } = snap.sessions
+	local folded = snap.folded
+	if sid ~= snap.current then
+		sessions = {}
+		for _, s in snap.sessions do
+			local copy = table.clone(s)
+			copy.current = s.id == sid
+			table.insert(sessions, copy)
+		end
+		folded = model.fold_rows(snap.rows, sid)
+	end
+	local out = table.clone(snap)
+	out.sessions = sessions
+	out.current = sid
+	out.folded = folded
+	out.focused_tab = tab_id
+	return out
 end
 
 --- What the poll reads next: one stale checkout at a time, then one stale ahead/behind
