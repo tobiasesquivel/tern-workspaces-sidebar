@@ -109,3 +109,37 @@ Code 2.1.296 y Codex 0.159.1.
 - `agent_prompt_stalled` se vio en vivo solo como síntoma de un bug ya
   corregido.
 
+## Resultados (2026-10-14): detección como herdr
+
+Cambio: el estado de Claude sale de la pantalla (manifests de herdr 2026.10.11.1 y el mismo
+motor de reglas); Codex usa los hooks de herdr v9 con la pantalla para los bloqueos; omp sigue
+con su extensión. Un loop del daemon lee pantalla y proceso de cada panel con agente, también
+los abiertos a mano. Los sonidos los toca el daemon, con la demora de 1 s de herdr. Desvíos y
+costos: `research/herdr-agent-detection.md` §9.
+
+Verificado en una ventana aislada (Tern 0.8.3, Claude Code 2.1.296, Codex 0.159.1,
+omp 18.10.4):
+
+- Claude abierto a mano: `unknown` → `idle` a los ~3,7 s; un turno → `working` → `done` y
+  `done.mp3` ~1 s después; `AskUserQuestion` → `blocked` (`live_blocked_form`) y
+  `request.mp3`; permiso de Bash en modo manual → `blocked` (`bash_permission_prompt`) y
+  `request.mp3`; aprobar → `working` → `done`; enfocar la tab → `idle`; `/exit` → la entrada
+  se va en ~1,4 s.
+- Claude por `start`: listo en 10 s con sesión y `resume_argv`; una pregunta → `blocked` con
+  el texto de la pregunta (pista del hook), `request.mp3` a 1 s; responder → `done`,
+  `done.mp3` a 1 s.
+- Codex por `start` (CODEX_HOME de laboratorio): confianza de carpeta →
+  `agent_not_ready: trust_directory` en 5 s; sandbox → `blocked`; listo sin `done` falso;
+  turno por hooks → `done`; aprobación fuera del workspace → `blocked` con el motivo del hook
+  y `request.mp3`; rechazarla → `working` → `done`.
+- omp: con perfil nuevo, `start` → `agent_not_ready: omp_setup_wizard` (antes `agent_started`
+  dentro del asistente); salir del asistente → listo sin `done`; `/exit` y otro `start` en el
+  mismo panel → `agent_started` (antes `agent_pane_busy`); omp a mano y `/exit` → la entrada
+  nativa se va.
+- Costo con un Claude en reposo, 30 s: 22 `capture`, 10 `process`, 13 `ls` (descubrimiento) y
+  un `tern events` vivo; un spawn ronda 200 ms.
+- Suites: Node 212 pasan (1 salteado en Windows); Luau 569 sin fallas offline y en la
+  ventana; `tern.log` sin errores de `workspaces-sidebar`. El runner `ws-tests` pasó su
+  presupuesto dos veces, en pasos que este cambio no toca: `group` con la máquina cargada
+  (corrida repetida: 1 ms) y `live`, que corre sin fixture.
+

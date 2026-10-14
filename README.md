@@ -65,10 +65,24 @@ working, `1✓` one finished turn nobody has seen.
 The badges come from a small daemon (`runtime/`, Node) that keeps one state per agent pane. It
 starts on its own the first time the sidebar needs it, keeps its files outside Tern's config
 (`%LOCALAPPDATA%\tern-agent-runtime\<hash>`, `~/Library/Application Support/...` on macOS,
-`$XDG_DATA_HOME/...` on Linux) and stops with nothing to clean up. Each agent reports through
-its own connector: omp through an extension, Claude Code and Codex through hooks the launcher
-passes on their command line. Nothing is written to your agents' own configuration, and nothing
-is approved on your behalf.
+`$XDG_DATA_HOME/...` on Linux) and stops with nothing to clean up. Where each state comes from
+follows herdr:
+
+- **omp** reports its whole lifecycle through an extension the launcher loads.
+- **Claude Code** is read off its screen. The daemon reads every Claude pane, the ones `start`
+  launched and the ones you opened by hand, with herdr's own detection rules (the
+  `agent-detection` manifests, bundled in `runtime/connectors/manifests/`; a newer copy in
+  herdr's cache on the machine wins). Claude's hooks only bring its session (for `resume`) and
+  the text of a question or a permission, never a state.
+- **Codex** reports its turns through hooks (`UserPromptSubmit` → working, `Stop` and
+  `Interrupt` → idle), and its screen decides the rest: a dialog on screen is `blocked` even
+  while the hook says working, and before the first hook the screen is all there is.
+
+The daemon reads screens through `tern capture` and processes through `tern process`, one of
+each at a time: about every 300 ms while an agent works, every second while it rests, at once
+when its title changes. An agent that appears waits 3 seconds before its first read, as in
+herdr. Nothing is written to your agents' own configuration, and nothing is approved on your
+behalf.
 
 States: `working`, `blocked` (a question or a permission, with its reason), `idle`, `done` (a
 finished turn you have not looked at) and `unknown`. The CLI speaks the same JSON as herdr's
@@ -83,9 +97,9 @@ node runtime/cli.mjs get scout
 node runtime/cli.mjs read scout --lines 40
 ```
 
-`start` launches the agent in an existing pane and answers once it is ready for input, or
-`agent_not_ready` with the reason when a startup dialog (folder trust, an update prompt, a hooks
-review) is waiting for you. `prompt` refuses a blocked agent before typing anything, and with
+`start` launches the agent in an existing pane and answers once it is ready for input (its
+prompt on screen), or `agent_not_ready` with the reason when a startup dialog (folder trust, an
+update prompt, Codex's sandbox setup, omp's first-run setup) is waiting for you. `prompt` refuses a blocked agent before typing anything, and with
 `--wait` it answers `agent_prompt_stalled` when the prompt changes nothing within 5 seconds.
 `list`, `get` and `read` never mark a finished turn as seen. When the agent exits, its name,
 state and resume command are released; while it runs, `get` shows the command that resumes its
@@ -100,17 +114,15 @@ Two chimes, one per edge, the same ones herdr plays:
 | `done` | the agent in a tab you are not looking at finished its turn |
 | `request` | the agent is asking you something: a permission, or an answer |
 
-A first sighting of a pane, a state repeated, and an agent that exits are all silent. An agent
-in the tab you are on never chimes when it finishes: Tern reports no window focus, so "you are
-looking at it" is the tab you are on, and a tab in a background window counts as one you are
-looking at. A question is the one thing that sounds wherever you are. When two chimes come in
-the same moment, the request is the one that plays.
+A first sighting of a pane, a state repeated, a launch, and an agent that exits are all silent.
+An agent in the tab you are on never chimes when it finishes: Tern reports no window focus, so
+"you are looking at it" is the tab you are on, and a tab in a background window counts as one
+you are looking at. A question is the one thing that sounds wherever you are.
 
-The badge and the chime are the same observation: the sidebar keeps one state per pane and
-judges the chime when that state moves, so the `?` never appears before the sound, and the chime
-does not wait for a repaint or for the sidebar to be open. The player itself is started by the
-agent runtime, outside the window: starting a process from a Tern hook can take longer than the
-hook may run, and that would freeze the sidebar.
+As in herdr, a sound waits one second and plays only if the agent is still in the state that
+earned it: a question answered within the second, or a turn that starts again, stays silent.
+The agent runtime plays them: it sees every state change, and it starts the player outside the
+window, where a process start cannot freeze the sidebar.
 
 The two files are `sounds/done.mp3` and `sounds/request.mp3` inside the plugin folder; replace
 them with your own mp3s under the same names to change the sounds. To mute them, run
@@ -118,7 +130,8 @@ them with your own mp3s under the same names to change the sounds. To mute them,
 through the bundled `scripts/play.vbs` (MediaPlayer, hidden). Linux is not implemented, so
 there the chimes are silent.
 
-The two mp3s and the Windows player (`scripts/play.ps1`) are herdr's
+The two mp3s, the Windows player (`scripts/play.ps1`) and the detection manifests
+(`runtime/connectors/manifests/claude.toml` and `codex.toml`) are herdr's
 (`github.com/herdrdev/herdr`), under the Apache License 2.0; the license text ships with them
 in [`sounds/LICENSE`](sounds/LICENSE).
 
@@ -143,6 +156,11 @@ does, so it runs no git process while you work; only the worktree actions do.
   heavily loaded machine one of those can still run long.
 - Only omp, Claude Code and Codex report states. Codex runs with its hooks passed as `-c`
   overrides, which makes it skip its shared background server for that session.
+- Tern tells the runtime when a pane's title changes but not when its output does, so a
+  resting agent's screen is read once a second (herdr reads it only after new output). Each
+  read is a `tern capture` process, about 200 ms on a Windows machine.
+- `start` takes omp as ready when its own prompt line (`π > …` above `╰─`) is on screen. A
+  status line configured away from that shape keeps `start` waiting until its timeout.
 
 ## License
 
