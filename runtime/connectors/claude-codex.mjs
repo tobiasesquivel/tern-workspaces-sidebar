@@ -26,27 +26,19 @@
 // Hooks (same binary in both): node <connectorDir>/hook.mjs with baked
 // --data-dir/--launch-id/--pane flags AND env fallback. Hook never blocks
 // or decides: exit 0 silent (claude) / no-output success (codex).
-// Event wiring per corrected parent rules:
-//   claude (--settings hooks): SessionStart(matcher *, identity),
-//     UserPromptSubmit (working), PermissionRequest(matcher *, blocked),
-//     PreToolUse(matcher AskUserQuestion — the ONLY generic-tool block),
-//     PostToolUse(matcher *, working), Stop(matcher *, idle+ready),
-//     SessionEnd(matcher *, release), Notification(matcher
-//     permission_prompt|elicitation_* — blocked; other types ignored by
-//     hook.mjs), Elicitation (blocked). NO PreToolUse generic matcher.
-//   codex (-c hooks.<Event> overrides): SessionStart(matcher startup|resume,
-//     identity; transcript_path required by codex for rollout refs),
-//     UserPromptSubmit (working), PermissionRequest(matcher *, blocked),
-//     PostToolUse(matcher *, working), Stop(matcher *, idle+ready),
-//     SessionEnd(matcher other, release). NO PreToolUse hook at all
-//     (codex questions surface via PermissionRequest/elicitation/blocker
-//     surfaces, never PreToolUse) — PreToolUse AskUserQuestion does not
-//     exist for codex and a PreToolUse hook would risk false blocks.
+// Event wiring, as herdr (research/herdr-agent-detection.md §1.3) — the screen
+// is the state, read by the daemon's detection loop:
+//   claude (--settings hooks): SessionStart (identity, as herdr), plus the
+//     events that carry a question's text as a message hint, never a state:
+//     PermissionRequest, PreToolUse(matcher AskUserQuestion), Notification
+//     (permission_prompt|elicitation_*), Elicitation.
+//   codex (-c hooks.<Event> overrides): herdr v9's SessionStart (identity),
+//     UserPromptSubmit (working), Stop and Interrupt (idle), plus
+//     PermissionRequest as a message hint.
 //
 // Resume: hook SessionStart reports session {kind id|path} + resume_argv
 // (claude ["claude", "--resume", id], codex ["codex", "resume", id]); core stores per pane.
-// Exit frees: launch.mjs releases after child exit; SessionEnd hook also
-// releases (idempotent, seq-guarded).
+// Exit frees: launch.mjs releases after the child exits.
 //
 // Verified versions: claude 2.1.288, codex-cli 0.159.1 (`--version`,
 // 2026-10-12). Flags verified via installed --help (no network).
@@ -84,16 +76,14 @@ export function claudeSettingsJson({ hookPath, nodePath, dataDir, launchId, pane
     timeout: 10,
     ...extra,
   });
+  // herdr installs SessionStart only: Claude's state is its screen. The rest carry
+  // the text of a question or a permission, a message hint the screen cannot give.
   return {
     hooks: {
       SessionStart: [{ matcher: "startup|resume|clear|compact|fork", hooks: [hook("SessionStart")] }],
-      UserPromptSubmit: [{ hooks: [hook("UserPromptSubmit")] }],
       PermissionRequest: [{ matcher: "*", hooks: [hook("PermissionRequest")] }],
       // ONLY AskUserQuestion: the single tool whose UI is a user question.
       PreToolUse: [{ matcher: "AskUserQuestion", hooks: [hook("PreToolUse")] }],
-      PostToolUse: [{ matcher: "*", hooks: [hook("PostToolUse")] }],
-      Stop: [{ hooks: [hook("Stop")] }],
-      SessionEnd: [{ matcher: "*", hooks: [hook("SessionEnd")] }],
       Notification: [
         {
           matcher: "permission_prompt|elicitation_dialog|elicitation_url_dialog",
@@ -189,18 +179,21 @@ export function codexHooksJson({ hookPath, nodePath, dataDir, launchId, paneId }
       type: "command",
       command: shell,
       commandWindows: shell,
-      timeout: event === "SessionEnd" ? 3 : 10,
+      // codex clamps SessionEnd/Interrupt to 1..3 s (codexNormalizedTimeout).
+      timeout: event === "SessionEnd" || event === "Interrupt" ? 3 : 10,
       ...extra,
     };
   };
+  // herdr v9 (src/integration/targets.rs): SessionStart for the session, and
+  // UserPromptSubmit/Stop/Interrupt for the turn. PermissionRequest is ours: a
+  // message hint, never a state.
   return {
     hooks: {
       SessionStart: [{ matcher: "startup|resume|clear|compact", hooks: [hook("SessionStart")] }],
       UserPromptSubmit: [{ hooks: [hook("UserPromptSubmit")] }],
-      PermissionRequest: [{ matcher: "*", hooks: [hook("PermissionRequest")] }],
-      PostToolUse: [{ matcher: "*", hooks: [hook("PostToolUse")] }],
       Stop: [{ hooks: [hook("Stop")] }],
-      SessionEnd: [{ matcher: "other", hooks: [hook("SessionEnd")] }],
+      Interrupt: [{ hooks: [hook("Interrupt")] }],
+      PermissionRequest: [{ matcher: "*", hooks: [hook("PermissionRequest")] }],
     },
   };
 }
@@ -390,14 +383,6 @@ function codexArgs({ dataDir, launchId, paneId, connectorDir, nodePath }) {
   const hookPath = join(connectorDir, "hook.mjs");
   return codexSessionFlags(codexHooksJson({ hookPath, nodePath, dataDir, launchId, paneId }));
 }
-
-// Readiness probe (NOT a hook event): launch.mjs runs `node hook.mjs
-// --event ReadyProbe --probe-text <surface>` after spawn; hook.mjs maps it
-// to idle+ready ONLY when classifySurface(agent, text) is idle on real
-// prompt evidence, else honestly ignores (stays pending). This is the ONLY
-// pre-prompt ready signal: SessionStart proves identity, never readiness.
-export const PROBE_EVENT = "ReadyProbe";
-export const PROBE_STATE = "idle";
 
 // prepareLaunch(agent, nativeArgs, childEnv, context) -> {command,args,env,cleanup?}.
 // context = { dataDir, launchId, paneId, connectorDir } (camelCase, locked with

@@ -1,7 +1,7 @@
 // runtime/server.mjs — loopback daemon: sole writer/arbitrator of final state.
 // Owner: RuntimeCore.
-// serve({dataDir, tern?, pollMs?, classify?}) -> {dataDir, port, token, state,
-// close, ingest, persist, stats}.
+// serve({dataDir, tern?, pollMs?, classify?, detection?, notifyDelayMs?}) ->
+// {dataDir, port, token, state, close, ingest, persist, stats, detection, notifier}.
 // RPC: POST /rpc JSON {token, method, params} ->
 //      {ok:true,result} | {ok:false,error:{code,message}}.
 // Methods: claim/report/release/list/get (core, from ./state.mjs),
@@ -13,15 +13,16 @@
 // of piling up): plugin observation-*.json files (freshness by mtime — stale
 // files are ignored, never applied; per-stream observe with sweep:false, then
 // ONE union sweep so one window's empty list never sweeps another stream's
-// occupants; files dead for 10 min are deleted; a chime the aside hands over in
-// its observation is played here, once per seq, so the window never spawns the
-// player) + tern.list() discovery every
-// 2 s, or every cycle while a launch is pending (raw `tern ls`
-// {sessions,detached}: meta enrichment on each discovery, explicit exited blocks, per-pane process() probing
-// for occupant-less panes with wrapper-guard (launch.mjs mid-launch never
-// invents an occupant), agent-kind matching so pre-existing wrapper-less
-// agents are discovered with the rail closed, and capture+classifySurface
-// (ThirdConnectors) for ready/state; failure retains). Persists snapshot.json
+// occupants; files dead for 10 min are deleted; the rail's `sound` flag mutes
+// the notifier) + tern.list() discovery every 2 s (raw `tern ls`
+// {sessions,detached}: meta enrichment and titles on each discovery, explicit
+// exited blocks, per-pane process() probing for occupant-less panes with
+// wrapper-guard (launch.mjs mid-launch never invents an occupant), agent-kind
+// matching so agents opened by hand are discovered with the rail closed; a
+// pane back at its shell is never an agent; failure retains). Beside it run
+// the detection loop (./detection.mjs: herdr's screen and process loop over
+// `tern capture`/`tern process`, with titles from `tern events`) and the
+// notifier (./notify.mjs: herdr's sounds, 1 s delay). Persists snapshot.json
 // atomically + pane-<id>.json per occupant, sweeps stale pane files, plus a
 // ~5s heartbeat rewrite (snapshot_at advances even when seq is unchanged, so
 // the aside's advance-based freshness keeps working). Writes are serialized
@@ -38,6 +39,8 @@ import { createServer } from "node:http";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { RuntimeState, RuntimeError } from "./state.mjs";
+import { createDetectionLoop, interpretProcess } from "./detection.mjs";
+import { createNotifier } from "./notify.mjs";
 import {
   ensureDir,
   readJsonFile,
@@ -59,21 +62,17 @@ const OBS_FRESH_MS = 15000;
 // not leave one more file for every ingest to stat forever.
 const OBS_PRUNE_MS = 10 * 60 * 1000;
 // `tern ls` is a process spawn that costs ~250 ms against the Tern daemon, so
-// discovery runs on its own cadence, not on every ingest — except while a
-// launch is pending, when `start` waits on the capture+classify it carries.
+// discovery runs on its own cadence, not on every ingest. A pending launch is
+// the detection loop's: it probes the pane until the agent is there.
 const DISCOVERY_MS = 2000;
-// A chime the aside handed over plays only while this fresh next to the observation's
-// own clock (`observed_at - chime.at`): heartbeats keep carrying the last chime, and a
-// daemon that starts later must not replay it.
-const CHIME_FRESH_MS = 2000;
 // herdr's bound on a player: long enough for either mp3.
 const PLAY_MS = 15000;
 const PLUGIN_DIR = join(dirname(fileURLToPath(import.meta.url)), "..");
 
-// The aside's chime, started here instead of in the window: a spawn from a window hook
-// can pass Tern's 50 ms budget on its own, and one past it disables every timer of the
-// plugin. Same players as sound.luau: Windows wscript + play.vbs/play.ps1 (no console
-// window), macOS afplay, Linux none (the README says so).
+// The notifier's player, started here instead of in the window: a spawn from a window
+// hook can pass Tern's 50 ms budget on its own, and one past it disables every timer of
+// the plugin. Same players as sound.luau: Windows wscript + play.vbs/play.ps1 (no
+// console window), macOS afplay, Linux none (the README says so).
 function defaultPlayChime(kind) {
   const file = join(PLUGIN_DIR, "sounds", `${kind}.mp3`);
   if (!existsSync(file)) return;
@@ -96,11 +95,10 @@ function defaultPlayChime(kind) {
     // a player that cannot start is a missed sound, never a daemon error
   }
 }
-// Discovery probe budgets per ingest cycle. process() is one spawn per pane;
-// capture pulls surface text. Re-probe of unchanged panes at most every
-// FULL_PROBE_MS so a shell that later starts an agent is still discovered.
+// Discovery probe budget per ingest cycle: process() is one spawn per pane.
+// Re-probe of unchanged panes at most every FULL_PROBE_MS so a shell that later
+// starts an agent is still discovered.
 const PROBE_BUDGET = 6;
-const CAPTURE_BUDGET = 2;
 const FULL_PROBE_MS = 15000;
 
 function tokenEqual(a, b) {
@@ -199,29 +197,6 @@ function entryMeta(e) {
   };
 }
 
-// Bounded deep scan of a process() result for human-readable command strings.
-function procStrings(proc) {
-  const out = [];
-  const visit = (v, depth) => {
-    if (out.length > 24 || depth > 3) return;
-    if (typeof v === "string") {
-      if (v.length > 0 && v.length <= 500) out.push(v);
-      return;
-    }
-    if (Array.isArray(v)) {
-      for (const x of v) visit(x, depth + 1);
-      return;
-    }
-    if (v && typeof v === "object") {
-      for (const k of ["command", "program", "cmdline", "cmd", "argv", "args", "line", "name", "process", "foreground", "child"]) {
-        if (k in v) visit(v[k], depth + 1);
-      }
-    }
-  };
-  visit(proc, 0);
-  return out;
-}
-
 function blockStrings(b) {
   const out = [];
   for (const k of ["command", "program", "agent_command", "model", "title"]) {
@@ -230,47 +205,62 @@ function blockStrings(b) {
   return out;
 }
 
-function matchAgent(strs) {
-  for (const s of strs) {
-    const first = String(s).split(/[\\/]/).pop().split(/\s+/)[0].toLowerCase().replace(/\.exe$/, "");
-    if (first === "omp" || first === "claude" || first === "codex") return first;
-  }
-  const blob = strs.join("\n").toLowerCase();
-  if (/(^|[\/\\])omp(\.exe)?(\s|$)/.test(blob)) return "omp";
-  if (/(^|[\/\\])claude(\.exe)?(\s|$)/.test(blob)) return "claude";
-  if (/(^|[\/\\])codex(\.exe)?(\s|$)/.test(blob)) return "codex";
-  return null;
-}
 
-// The start wrapper runs `node runtime/launch.mjs ...` in the pane before the
-// agent spawns. Never mistake that mid-launch shell for a free agent pane:
-// the pending claim owns the pane until the wrapper reports or releases.
-function isWrapper(strs) {
-  return strs.some((s) => s.includes("launch.mjs"));
-}
-
-// classifySurface contract (ThirdConnectors owner, runtime/connectors/detect.mjs):
-// SYNC classifySurface(agent:'claude'|'codex', text:string) ->
-// {state:'idle'|'working'|'blocked'|'unknown', rule:string|null} | null.
-// Surface-only: claude idle iff bare prompt box; codex surface alone never
-// yields idle (unknown). No message/ready from the classifier — readiness is
-// the connector's report `ready` flag, never inferred here. serve() also
-// accepts an injected classify fn (tests / overrides). Missing module = no
-// surface classification (discovery falls back to 'unknown', never silence).
-let classifyCache;
-async function loadClassify() {
-  if (classifyCache !== undefined) return classifyCache;
-  try {
-    const mod = await import("./connectors/detect.mjs");
-    if (typeof mod.classifySurface === "function") {
-      classifyCache = mod.classifySurface;
-      return classifyCache;
+// Titles from `tern events` (one long-lived child, never a hook): the OSC title
+// region of herdr's manifests and the activity signal of the detection loop.
+// Restarts after a pause when the child ends; a tern without `events` (tests,
+// older builds) leaves titles to discovery's `tern ls`.
+const TITLE_RESTART_MS = 5000;
+function followTitles(tern, onTitle) {
+  let child = null;
+  let stopped = false;
+  let timer = null;
+  const begin = () => {
+    if (stopped) return;
+    try {
+      child = tern.events(["title_changed"]);
+    } catch {
+      child = null;
     }
-  } catch {
-    // module not landed yet: discovery falls back to unknown
-  }
-  classifyCache = null;
-  return null;
+    if (!child || !child.stdout) {
+      timer = setTimeout(begin, TITLE_RESTART_MS);
+      timer.unref?.();
+      return;
+    }
+    let buf = "";
+    child.stdout.setEncoding?.("utf8");
+    child.stdout.on("data", (chunk) => {
+      buf += chunk;
+      let nl;
+      while ((nl = buf.indexOf("\n")) >= 0) {
+        const line = buf.slice(0, nl).trim();
+        buf = buf.slice(nl + 1);
+        if (!line) continue;
+        try {
+          const ev = JSON.parse(line);
+          const pane = numId(ev?.pane);
+          if (ev?.event === "title_changed" && pane !== null && typeof ev.title === "string") onTitle(pane, ev.title);
+        } catch {
+          // a line that is not JSON is skipped
+        }
+      }
+    });
+    child.on("error", () => {});
+    child.on("exit", () => {
+      child = null;
+      if (stopped) return;
+      timer = setTimeout(begin, TITLE_RESTART_MS);
+      timer.unref?.();
+    });
+  };
+  begin();
+  return () => {
+    stopped = true;
+    if (timer) clearTimeout(timer);
+    try {
+      child?.kill();
+    } catch {}
+  };
 }
 
 export async function serve({
@@ -280,6 +270,8 @@ export async function serve({
   discoveryMs = DISCOVERY_MS,
   classify = null,
   playChime = defaultPlayChime,
+  detection: detectionEnabled = true,
+  notifyDelayMs = undefined,
 } = {}) {
   if (!dataDir || typeof dataDir !== "string") throw new RuntimeError("invalid_data_dir", "dataDir required");
   // Single writer: the owner lock is acquired BEFORE any state, snapshot,
@@ -292,6 +284,31 @@ export async function serve({
   });
   await ensureDir(dataDir);
   const state = new RuntimeState();
+  // The sounds are the daemon's (./notify.mjs): it sees every transition and
+  // starts the player outside the window. The rail's `sound` flag mutes them.
+  let soundOn = true;
+  const notifier = createNotifier({
+    state,
+    play: (kind) => playChime(kind),
+    muted: () => !soundOn,
+    ...(typeof notifyDelayMs === "number" ? { delayMs: notifyDelayMs } : {}),
+  });
+  // The detection loop (./detection.mjs): screens and processes of the agent
+  // panes, read through the tern CLI. Its timer runs unless a test drives it.
+  const detection =
+    tern && typeof tern.capture === "function" && typeof tern.process === "function"
+      ? createDetectionLoop({ state, tern, ...(classify ? { classify } : {}) })
+      : null;
+  if (detection && detectionEnabled) detection.start();
+  // A state change reaches snapshot.json at once, not on the next ingest (which
+  // may be waiting on a `tern ls`): the rail reads only that file.
+  state.onTransition(() => {
+    persist().catch(() => {});
+  });
+  const stopTitles =
+    detection && detectionEnabled && typeof tern.events === "function"
+      ? followTitles(tern, (pane, title) => detection.noteTitle(pane, title))
+      : () => {};
   // Commands module is CLI-owner (runtime/commands.mjs). Loaded lazily so a
   let commands = null;
   async function getCommands() {
@@ -353,10 +370,9 @@ export async function serve({
     ingestSkipped: 0,
     staleSkipped: 0,
     probed: 0,
-    classified: 0,
   };
 
-  async function discover(classifyFn) {
+  async function discover() {
     let raw;
     try {
       raw = await tern.list();
@@ -365,6 +381,13 @@ export async function serve({
     }
     const entries = walkLs(raw);
     const lsPanes = new Set(entries.map((e) => e.pane));
+    // Titles as `tern ls` has them: the OSC title region until `tern events`
+    // brings a newer one.
+    if (detection) {
+      for (const e of entries) {
+        if (typeof e.block.title === "string") detection.setTitle(e.pane, e.block.title);
+      }
+    }
     paneIndex = entries.map((e) => ({ pane_id: e.pane, tab_id: typeof e.tab === "number" ? e.tab : null }));
     paneIndexKey = JSON.stringify(paneIndex);
     // Meta enrichment for every listed pane (free: no spawn, never creates).
@@ -408,59 +431,15 @@ export async function serve({
     }
 
     // Probe occupant-less panes: new/changed blocks immediately, unchanged
-    // ones on the periodic full pass. Budgeted per cycle.
+    // ones on the periodic full pass. Budgeted per cycle. A pane whose process
+    // names an agent becomes a native occupant, `unknown` until the detection
+    // loop reads its screen after herdr's startup grace (Claude/Codex) or the
+    // rail's list speaks for it (omp).
     const now = Date.now();
     const full = now - lastFullProbe > FULL_PROBE_MS;
     if (full) lastFullProbe = now;
     let probes = 0;
-    let captures = 0;
     const agentObs = [];
-    const unionExtra = new Set();
-    // Pending-pane classify (claude/codex startup readiness, rail closed):
-    // the occupant-less probe below skips live panes, so a start-claimed
-    // pending occupant would never get capture+classify and start would stall
-    // until first Stop. This pass runs FIRST (start's 30s timeout is tighter
-    // than discovery freshness) and shares the capture budget. Only
-    // unknown/idle pendings are probed — working/blocked reported states are
-    // never touched. Only a classified idle surface pushes {idle, ready}:
-    // honest evidence only. The observe() connector branch elevates
-    // unknown->idle and clears pending; a release racing this pass is
-    // re-verified at push time (still live + still pending), so a dead
-    // occupant can never be minted from a surface.
-    for (const a of live.values()) {
-      if (a.launch_pending !== true) continue; // pending => connector (natives never pend)
-      if (a.agent !== "claude" && a.agent !== "codex") continue; // omp has its own extension
-      if (a.agent_status !== "unknown" && a.agent_status !== "idle") continue; // never touch working/blocked
-      if (captures >= CAPTURE_BUDGET) break;
-      let text = "";
-      try {
-        const cap = await tern.capture(String(a.pane_id), { surfaces: true });
-        text = cap && typeof cap.text === "string" ? cap.text : "";
-      } catch {
-        continue; // failure retains, retry next cycle
-      }
-      const cls = classifyFn ? classifyFn(a.agent, text) : null;
-      if (!cls || (cls.state !== "idle" && cls.state !== "blocked")) continue; // honest evidence only
-      captures += 1;
-      stats.classified += 1;
-      try {
-        if (state.get(a.pane_id).launch_pending !== true) continue;
-      } catch {
-        continue; // released mid-pass: never mint from a surface
-      }
-      if (cls.state === "blocked") {
-        agentObs.push({
-          pane: a.pane_id,
-          agent: a.agent,
-          state: "blocked",
-          message: typeof cls.rule === "string" ? cls.rule : "awaiting input",
-        });
-      } else {
-        agentObs.push({ pane: a.pane_id, agent: a.agent, state: "idle", ready: true });
-      }
-      unionExtra.add(a.pane_id);
-    }
-
     for (const e of entries) {
       if (live.has(e.pane)) continue;
       const sig = blockSig(e.block);
@@ -474,74 +453,42 @@ export async function serve({
       } catch {
         continue; // pane unreadable this cycle: retain, retry later
       }
-      const strs = procStrings(proc);
-      if (isWrapper(strs)) continue; // mid-launch: pending claim lives on
-      const agent = matchAgent(strs) ?? matchAgent(blockStrings(e.block)) ?? (e.block.kind === "agent" ? "omp" : null);
-      if (!agent) continue; // free shell: never invent an occupant from silence
-      let st = "unknown";
-      let rule = null;
-      // Classifier is surface-only for claude/codex (detect.mjs). omp native
-      // state comes from the connector hook + waiting_input, never from a
-      // text classifier: probing an omp occupant-less pane yields unknown
-      // (present, unclassified) until its reporter speaks.
-      if ((agent === "claude" || agent === "codex") && classifyFn && captures < CAPTURE_BUDGET) {
-        try {
-          const cap = await tern.capture(String(e.pane), { surfaces: true });
-          const text = cap && typeof cap.text === "string" ? cap.text : "";
-          const cls = classifyFn(agent, text);
-          if (cls && typeof cls.state === "string") {
-            st = cls.state;
-            rule = typeof cls.rule === "string" ? cls.rule : null;
-            captures += 1;
-            stats.classified += 1;
-          }
-        } catch {
-          // capture/classify failure: keep unknown, retry on next full pass
-        }
-      }
+      const r = interpretProcess(proc);
+      if (r.wrapper && !r.agent) continue; // mid-launch: pending claim lives on
+      // A pane back at its own shell has no agent, whatever its block still
+      // says (Tern kept `kind: "agent"` on a pane omp had left: the old
+      // fallback minted a native omp there that blocked `start` forever).
+      if (r.free || !r.agent) continue;
+      state.clearFree(e.pane);
       agentObs.push({
         pane: e.pane,
-        agent, // verified against the live foreground process (matchAgent)
-        command: blockStrings(e.block)[0] ?? strs[0] ?? agent,
+        agent: r.agent, // verified against the live foreground process
+        command: blockStrings(e.block)[0] ?? r.agent,
         model: typeof e.block.model === "string" ? e.block.model : undefined,
         cwd: typeof e.block.cwd === "string" ? e.block.cwd : undefined,
-        state: st,
-        ...(rule !== null ? { rule } : {}),
+        state: "unknown",
       });
     }
     stats.probed += probes;
     for (const k of [...sigCache.keys()]) {
       if (!lsPanes.has(k)) sigCache.delete(k);
     }
-    return { lsFresh: true, lsPanes, agentObs, unionExtra };
+    return { lsFresh: true, lsPanes, agentObs };
   }
 
   const observedFiles = new Map(); // name -> mtimeMs already ingested
-  // The last chime seq played per publisher generation: a chime plays once.
-  const chimeSeen = new Map();
-  function maybeChime(raw) {
-    const c = raw?.chime;
-    if (!c || typeof c !== "object" || typeof c.seq !== "number") return;
-    if (c.kind !== "done" && c.kind !== "request") return;
-    const gen = typeof raw.generation === "string" ? raw.generation : "";
-    if ((chimeSeen.get(gen) ?? 0) >= c.seq) return;
-    chimeSeen.set(gen, c.seq);
-    if (chimeSeen.size > 16) chimeSeen.delete(chimeSeen.keys().next().value);
-    if (typeof raw.observed_at !== "number" || typeof c.at !== "number") return;
-    if (raw.observed_at - c.at > CHIME_FRESH_MS) return;
-    try {
-      playChime(c.kind);
-    } catch {
-      // a missed sound, never an ingest failure
-    }
+  // The rail's sound switch rides its observation (`sound: false` mutes). A
+  // `chime` an older rail still hands over is not played: the notifier already
+  // chimed that transition, after herdr's delay.
+  function takeSoundFlag(raw) {
+    if (typeof raw?.sound === "boolean") soundOn = raw.sound;
   }
   // The last discovery that answered: when, and the panes it keeps alive. The
   // cycles in between reuse that keep set, so a native only discovery sees is
   // never swept by a cycle that did not look.
   let lastDiscovery = { at: -Infinity, keep: null };
   function discoveryDue(now) {
-    if (now - lastDiscovery.at >= discoveryMs) return true;
-    return state.list().some((a) => a.launch_pending === true);
+    return now - lastDiscovery.at >= discoveryMs;
   }
   let ingesting = false; // single-flight: overlapping ticks skip, never pile up
   async function ingest() {
@@ -575,7 +522,7 @@ export async function serve({
         } catch {
           continue; // invalid file: retain previous state
         }
-        maybeChime(raw);
+        takeSoundFlag(raw);
         const r = state.observe(raw, { sweep: false });
         if (!r.applied) continue;
         freshStreams += 1;
@@ -601,17 +548,15 @@ export async function serve({
           for (const p of lastDiscovery.keep) unionKeep.add(p);
         }
       } else if (tern && typeof tern.list === "function") {
-        const classifyFn = classify ?? (await loadClassify());
-        const d = await discover(classifyFn);
+        const d = await discover();
         if (d.lsFresh) {
-          const keep = new Set([...d.lsPanes, ...(d.unionExtra ?? []), ...d.agentObs.map((b) => b.pane)]);
+          const keep = new Set([...d.lsPanes, ...d.agentObs.map((b) => b.pane)]);
           lastDiscovery = { at: now, keep };
           freshStreams += 1;
           // ls trees carry no agent signal by themselves: listed panes are
           // kept (a pane that still exists never sweeps), vanished panes
           // fall out of the union and their natives die.
           for (const p of d.lsPanes) unionKeep.add(p);
-          for (const p of d.unionExtra ?? []) unionKeep.add(p);
           allEmptyFresh = false;
           if (d.agentObs.length > 0) {
             state.observe(
@@ -716,6 +661,8 @@ export async function serve({
   // without waiting out the TTL. once + removeListener-safe: close() guards.
   const onSignal = () => {
     clearInterval(timer);
+    detection?.stop();
+    stopTitles();
     releaseLock(dataDir, ticket).catch(() => {});
   };
   process.once("SIGINT", onSignal);
@@ -726,6 +673,8 @@ export async function serve({
     if (closed) return;
     closed = true;
     clearInterval(timer);
+    detection?.stop();
+    stopTitles();
     process.removeListener("SIGINT", onSignal);
     process.removeListener("SIGTERM", onSignal);
     await new Promise((r) => server.close(r));
@@ -736,5 +685,5 @@ export async function serve({
     await releaseLock(dataDir, ticket).catch(() => {});
   }
 
-  return { dataDir, port, token, state, close, ingest, persist, stats, owner: ticket };
+  return { dataDir, port, token, state, close, ingest, persist, stats, owner: ticket, detection, notifier };
 }

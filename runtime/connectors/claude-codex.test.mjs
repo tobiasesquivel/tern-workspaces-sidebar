@@ -10,19 +10,15 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { classifySurface } from "./detect.mjs";
 import {
-  addBlocker,
-  blockerIdFor,
   resumeArgv,
   epochForSession,
-  isIdentityEnding,
   mapEvent,
   nextSeq,
-  resolveBlockers,
   resolveRuntimeIdentity,
 } from "./hook.mjs";
 import {
+  claudeSettingsJson,
   codexSessionFlags,
   codexSessionFlagsSource,
   codexHookTrustHash,
@@ -39,371 +35,97 @@ function lab() {
   return mkdtempSync(join(tmpdir(), "tern-connector-test-"));
 }
 
-describe("classifySurface claude (herdr claude 2026.09.11.1)", () => {
-  it("marks the bare prompt box idle", () => {
-    assert.deepEqual(classifySurface("claude", "some work\n\n❯ "), {
-      state: "idle",
-      rule: "live_prompt_box",
-    });
-  });
-
-  it("marks the Windows prompt box idle: `>` plus a no-break space (live 2.1.296)", () => {
-    const surface = [
-      " Claude Code v2.1.296",
-      "──────────────────────────────",
-      ">\u00a0Try a prompt",
-      "──────────────────────────────",
-      "  auto mode on (shift+tab to cycle)",
-    ].join("\n");
-    assert.deepEqual(classifySurface("claude", surface), { state: "idle", rule: "live_prompt_box" });
-  });
-
-  it("does not take a shell prompt for the Claude prompt box", () => {
-    assert.equal(classifySurface("claude", "PS C:\\Users\\lab> ").state, "unknown");
-    assert.equal(classifySurface("claude", "> plain quoted line").state, "unknown");
-  });
-
-  it("marks a permission dialog blocked, not idle", () => {
-    const text = [
-      "do you want to proceed?",
-      "bash command: rm -rf build",
-      "❯ 1. Yes",
-      "  2. No",
-      "esc to cancel",
-    ].join("\n");
-    const out = classifySurface("claude", text);
-    assert.equal(out.state, "blocked");
-  });
-
-  it("marks AskUserQuestion-style select forms blocked", () => {
-    const text = [
-      "pick one ──────────────",
-      "enter to select",
-      "tab/arrow keys to navigate",
-      "esc to cancel",
-    ].join("\n");
-    assert.equal(classifySurface("claude", text).state, "blocked");
-  });
-
-  it("marks spinner output working", () => {
-    assert.equal(
-      classifySurface("claude", "✶ Working… (12s · esc to interrupt)").state,
-      "working",
-    );
-  });
-
-  it("is honestly unknown on empty or foreign text", () => {
-    assert.deepEqual(classifySurface("claude", ""), {
-      state: "unknown",
-      rule: null,
-    });
-    assert.deepEqual(classifySurface("claude", "omp turn output"), {
-      state: "unknown",
-      rule: null,
-    });
-    assert.deepEqual(classifySurface("nope", "❯ "), {
-      state: "unknown",
-      rule: null,
-    });
-  });
-});
-
-describe("classifySurface codex (herdr codex 2026.10.11.1)", () => {
-  it("marks the startup update picker blocked (startup_update, live 0.159.1)", () => {
-    const surface = [
-      "  Update available · 0.159.1 → 0.162.1",
-      "  Release notes: https://github.com/openai/codex/releases/latest",
-      "› 1. Update now (runs `powershell -ExecutionPolicy Bypass -c",
-      "  2. Skip",
-      "  3. Skip until next version",
-      "  enter continue · esc skip",
-    ].join("\n");
-    assert.deepEqual(classifySurface("codex", surface), { state: "blocked", rule: "startup_update" });
-  });
-
-  it("marks the resting composer idle without the agents hint (live 0.159.1, a warning in its place)", () => {
-    const surface = [
-      "  >_ OpenAI Codex (v0.159.1)",
-      "  Practical, peculiar, or a little of both?",
-      "› Ask Codex to do anything",
-      "  GPT-6.1-Sol default · ~\\lab",
-      "  ? for shortcuts                                      ⚠ 1 warning · f2 to view",
-    ].join("\n");
-    assert.deepEqual(classifySurface("codex", surface), { state: "idle", rule: "codex_composer_idle" });
-  });
-
-  it("does not take a passive update notice for the picker", () => {
-    assert.notEqual(classifySurface("codex", "Update available · 0.162.1 is out\n› ").rule, "startup_update");
-  });
-
-  it("marks Action Required blocked", () => {
-    assert.equal(
-      classifySurface("codex", "Codex — Action Required").state,
-      "blocked",
-    );
-  });
-
-  it("marks the trust dialog blocked", () => {
-    const text = [
-      "> You are in C:\\work",
-      "Do you trust the contents of this directory?",
-      "Trust this folder? Codex can read, edit, and run files here",
-      "Trust and continue",
-    ].join("\n");
-    assert.equal(classifySurface("codex", text).state, "blocked");
-  });
-
-  it("marks first-run dialogs blocked with reason (lab verbatim)", () => {
-
-    assert.deepEqual(
-      classifySurface("codex", "Hooks need review\n6 hooks are new or changed.\n\n› 1. Review hooks\n2. Trust all and continue\n\nenter confirm · esc skip"),
-      { state: "blocked", rule: "codex_hooks_review" },
-    );
-    // codex sandbox-setup (evidence §4c verbatim head): blocked.
-    assert.deepEqual(
-      classifySurface("codex", "Set up the Codex agent sandbox to protect your files\n› 1. Set up default sandbox (requires Administrator permissions)\n2. Use non-admin sandbox\n\nenter select · esc back"),
-      { state: "blocked", rule: "codex_sandbox_setup" },
-    );
-    // claude folder trust (lab 2.1.296 verbatim): blocked.
-    assert.deepEqual(
-      classifySurface("claude", "Is this a project you created or one you trust?\n> No, exit · Yes, I trust this folder"),
-      { state: "blocked", rule: "claude_folder_trust" },
-    );
-  });
-
-
-  it("marks the resting composer idle (evidence-backed rule)", () => {
-    const idle = [
-      "  >_ OpenAI Codex (v0.159.1)",
-      "› Ask Codex to do anything",
-      "",
-      "  GPT-6.1-Sol default · C:\\scratch",
-      "  ← for agents · ? for shortcuts",
-    ].join("\n");
-    assert.deepEqual(classifySurface("codex", idle), {
-      state: "idle",
-      rule: "codex_composer_idle",
-    });
-    // Same chrome mid-turn (working line present) stays working.
-    const busy = `${idle}\n◦ Working (1s • esc to interrupt)`;
-    assert.equal(classifySurface("codex", busy).state, "working");
-    // Bare calm text with no composer chrome stays honestly unknown.
-    assert.deepEqual(classifySurface("codex", "done, waiting"), {
-      state: "unknown",
-      rule: null,
-    });
-  });
-});
-
-describe("mapEvent (parent-corrected hook rules)", () => {
+describe("mapEvent (herdr: Claude's state is the screen's, Codex v9 hooks)", () => {
   it("resume argv names the executable first, as omp's does", () => {
     assert.deepEqual(resumeArgv("claude", {}, { kind: "id", value: "s1" }), ["claude", "--resume", "s1"]);
     assert.deepEqual(resumeArgv("codex", {}, { kind: "id", value: "r1" }), ["codex", "resume", "r1"]);
     assert.equal(resumeArgv("claude", {}, null), null);
   });
 
-  it("SessionStart reports identity only: unknown + not ready", () => {
-    const out = mapEvent("claude", "SessionStart", {
-      hook_event_name: "SessionStart",
-      session_id: "abc-123",
-      transcript_path: "/t/abc.jsonl",
-      source: "startup",
-    });
-    assert.equal(out.kind, "report");
-    assert.equal(out.fields.state, "unknown");
-    assert.equal(out.fields.ready, false);
-    assert.deepEqual(out.fields.session, { kind: "id", value: "abc-123" });
-    assert.equal(out.fields.session_start, true);
+  it("SessionStart reports identity only: no state, not ready", () => {
+    for (const agent of ["claude", "codex"]) {
+      const out = mapEvent(agent, "SessionStart", {
+        hook_event_name: "SessionStart",
+        session_id: "abc-123",
+        transcript_path: "/t/abc.jsonl",
+        source: "startup",
+      });
+      assert.equal(out.kind, "report");
+      assert.equal(out.fields.state, "unknown");
+      assert.equal(out.fields.ready, false);
+      assert.deepEqual(out.fields.session, { kind: "id", value: "abc-123" });
+      assert.equal(out.fields.session_start, true);
+    }
   });
 
-  it("PreToolUse Bash is ignored (never a generic block)", () => {
-    assert.deepEqual(
-      mapEvent("claude", "PreToolUse", {
-        hook_event_name: "PreToolUse",
-        tool_name: "Bash",
-        tool_input: { command: "rm -rf /tmp/x" },
-      }),
-      { kind: "ignore" },
-    );
+  it("Claude turn events decide nothing: the screen does", () => {
+    for (const event of ["UserPromptSubmit", "PostToolUse", "Stop", "SessionEnd", "Interrupt", "StopFailure"]) {
+      assert.deepEqual(mapEvent("claude", event, { hook_event_name: event }), { kind: "ignore" }, event);
+    }
   });
 
-  it("PreToolUse AskUserQuestion with payload is the only tool block", () => {
-    const out = mapEvent("claude", "PreToolUse", {
-      hook_event_name: "PreToolUse",
+  it("Codex v9: UserPromptSubmit is working, Stop and Interrupt are idle", () => {
+    assert.deepEqual(mapEvent("codex", "UserPromptSubmit", {}), { kind: "report", fields: { state: "working" } });
+    assert.deepEqual(mapEvent("codex", "Stop", {}), { kind: "report", fields: { state: "idle" } });
+    assert.deepEqual(mapEvent("codex", "Interrupt", {}), { kind: "report", fields: { state: "idle" } });
+    assert.deepEqual(mapEvent("codex", "PostToolUse", {}), { kind: "ignore" });
+  });
+
+  it("a question or a permission is a message hint, never a state", () => {
+    const ask = mapEvent("claude", "PreToolUse", {
       tool_name: "AskUserQuestion",
       tool_input: { questions: [{ question: "Which region?" }] },
     });
-    assert.equal(out.kind, "report");
-    assert.equal(out.fields.state, "blocked");
-    assert.match(out.fields.message, /Which region/);
-  });
-
-  it("PermissionRequest is blocked with the tool named", () => {
-    const out = mapEvent("codex", "PermissionRequest", {
-      hook_event_name: "PermissionRequest",
-      tool_name: "Bash",
-      tool_input: { command: "git push", description: "push branch" },
-    });
-    assert.equal(out.kind, "report");
-    assert.equal(out.fields.state, "blocked");
-    assert.match(out.fields.message, /Bash/);
-  });
-
-  it("PermissionRequest for AskUserQuestion keeps the question, not the permission", () => {
-    // Claude asks permission for its own question tool right after PreToolUse;
-    // the rail must still show what was asked.
-    const out = mapEvent("claude", "PermissionRequest", {
-      hook_event_name: "PermissionRequest",
+    assert.deepEqual(ask, { kind: "report", fields: { state: "blocked", hint: true, message: "Which region?" } });
+    // Claude asks permission for its own question tool right after PreToolUse:
+    // the hint keeps the question, not the permission for asking it.
+    const perm = mapEvent("claude", "PermissionRequest", {
       tool_name: "AskUserQuestion",
       tool_input: { questions: [{ question: "Which region?", header: "Region" }] },
     });
-    assert.equal(out.kind, "report");
-    assert.equal(out.fields.state, "blocked");
-    assert.equal(out.fields.message, "Which region?");
-  });
-
-  it("PermissionDenied is recovery: ignored, never an automatic state", () => {
-    assert.deepEqual(
-      mapEvent("claude", "PermissionDenied", {
-        hook_event_name: "PermissionDenied",
-        tool_name: "Bash",
-      }),
-      { kind: "ignore" },
-    );
-  });
-
-  it("Elicitation is a question: blocked", () => {
-    const out = mapEvent("claude", "Elicitation", {
-      hook_event_name: "Elicitation",
-      mcp_server_name: "tracker",
-      message: "Project key?",
+    assert.equal(perm.fields.message, "Which region?");
+    assert.equal(perm.fields.hint, true);
+    const bash = mapEvent("codex", "PermissionRequest", {
+      tool_name: "Bash",
+      tool_input: { command: "git push", description: "push branch" },
     });
-    assert.equal(out.kind, "report");
-    assert.equal(out.fields.state, "blocked");
+    assert.equal(bash.fields.hint, true);
+    assert.match(bash.fields.message, /Bash/);
+    const note = mapEvent("claude", "Notification", { notification_type: "permission_prompt", message: "needs approval" });
+    assert.deepEqual(note.fields, { state: "blocked", hint: true, message: "needs approval" });
+    assert.equal(mapEvent("claude", "Elicitation", { message: "Project key?" }).fields.message, "Project key?");
   });
 
-  it("idle Notification types are ignored; permission_prompt is blocked", () => {
-    assert.deepEqual(
-      mapEvent("claude", "Notification", {
-        hook_event_name: "Notification",
-        notification_type: "idle_prompt",
-        message: "idle",
-      }),
-      { kind: "ignore" },
-    );
-    const out = mapEvent("claude", "Notification", {
-      hook_event_name: "Notification",
-      notification_type: "permission_prompt",
-      message: "needs approval",
-    });
-    assert.equal(out.fields.state, "blocked");
+  it("other tools, idle notifications, denials and subagents are ignored", () => {
+    assert.deepEqual(mapEvent("claude", "PreToolUse", { tool_name: "Bash" }), { kind: "ignore" });
+    assert.deepEqual(mapEvent("claude", "Notification", { notification_type: "idle_prompt" }), { kind: "ignore" });
+    assert.deepEqual(mapEvent("claude", "PermissionDenied", { tool_name: "Bash" }), { kind: "ignore" });
+    assert.deepEqual(mapEvent("codex", "Stop", { agent_id: "sub-1" }), { kind: "ignore" });
+    assert.deepEqual(mapEvent("codex", "SubagentStop", {}), { kind: "ignore" });
+    assert.deepEqual(mapEvent("claude", "ReadyProbe", { probe_text: "❯ " }), { kind: "ignore" });
   });
+});
 
-  it("subagent traffic never moves the occupant", () => {
-    assert.deepEqual(
-      mapEvent("claude", "Stop", {
-        hook_event_name: "Stop",
-        agent_id: "sub-1",
-      }),
-      { kind: "ignore" },
-    );
-    assert.deepEqual(
-      mapEvent("codex", "SubagentStop", { hook_event_name: "SubagentStop" }),
-      { kind: "ignore" },
-    );
+describe("installed hooks (herdr's sets, plus message hints)", () => {
+  const ids = { hookPath: "/h/hook.mjs", nodePath: "node", dataDir: "/d", launchId: "L", paneId: 3 };
+  it("Claude: SessionStart for identity, and only the events that carry a question", () => {
+    assert.deepEqual(Object.keys(claudeSettingsJson(ids).hooks).sort(), [
+      "Elicitation",
+      "Notification",
+      "PermissionRequest",
+      "PreToolUse",
+      "SessionStart",
+    ]);
+    assert.equal(claudeSettingsJson(ids).hooks.PreToolUse[0].matcher, "AskUserQuestion");
   });
-
-  it("Stop ends the turn idle+ready; Interrupt keeps the occupant live", () => {
-    assert.deepEqual(mapEvent("claude", "Stop", { hook_event_name: "Stop" }), {
-      kind: "report",
-      fields: { state: "idle", ready: true },
-    });
-    // Interrupt is a turn-cancel: the agent stays live, so the hook reports
-    // unknown (never releases name/session/resume — plan §3 exit-only).
-    assert.deepEqual(
-      mapEvent("codex", "Interrupt", { hook_event_name: "Interrupt" }),
-      { kind: "report", fields: { state: "unknown" } },
-    );
-  });
-
-  it("SessionEnd logout ends identity; switch reasons keep the occupant", () => {
-    // logout/prompt_input_exit (documented claude reasons: user exits the CLI):
-    // report unknown+not-ready; the wrapper releases after the child exits.
-    for (const reason of ["logout", "prompt_input_exit"]) {
-      assert.deepEqual(
-        mapEvent("claude", "SessionEnd", { hook_event_name: "SessionEnd", reason }),
-        { kind: "report", fields: { state: "unknown", ready: false } },
-      );
-    }
-    // clear/resume/other (process stays alive, next SessionStart arrives on
-    // the same occupant): no release, name/session/resume survive.
-    for (const reason of ["clear", "resume", "other"]) {
-      assert.deepEqual(
-        mapEvent("claude", "SessionEnd", { hook_event_name: "SessionEnd", reason }),
-        { kind: "ignore" },
-      );
-    }
-  });
-
-  it("blocker ids correlate per tool call; unrelated completions keep blockers", async () => {
-    assert.equal(
-      blockerIdFor("Elicitation", { elicitation_id: "e1", mcp_server_name: "s" }),
-      "elicitation:e1",
-    );
-    assert.equal(blockerIdFor("PostToolUse", { tool_use_id: "t9" }), "tool:t9");
-    assert.equal(blockerIdFor("Stop", {}), null);
-    const dir = lab();
-    try {
-      await addBlocker(dir, "L1", "tool:AAA", { tool: "AskUserQuestion", message: "pick one" });
-      // Unrelated PostToolUse(B) resolves nothing: blocker survives.
-      const kept = await resolveBlockers(dir, "L1", "PostToolUse", { tool_use_id: "tB" });
-      assert.deepEqual(kept.resolved, []);
-      assert.ok(kept.remaining["tool:AAA"]);
-      // Matching completion resolves exactly its own id.
-      const cleared = await resolveBlockers(dir, "L1", "PostToolUse", { tool_use_id: "AAA" });
-      assert.deepEqual(cleared.resolved, ["tool:AAA"]);
-      assert.deepEqual(cleared.remaining, {});
-      // PermissionDenied without a pending match resolves nothing (honest).
-      await addBlocker(dir, "L1", "tool:QQ", { tool: "Bash", message: "approve?" });
-      const denied = await resolveBlockers(dir, "L1", "PermissionDenied", { tool_use_id: "tZ" });
-      assert.deepEqual(denied.resolved, []);
-      assert.ok(denied.remaining["tool:QQ"]);
-      const matched = await resolveBlockers(dir, "L1", "PermissionDenied", { tool_use_id: "QQ" });
-      assert.deepEqual(matched.resolved, ["tool:QQ"]);
-    } finally {
-      rmSync(dir, { recursive: true, force: true });
-    }
-  });
-
-  it("ReadyProbe reports idle+ready only on real prompt evidence", () => {
-    const ready = mapEvent("claude", "ReadyProbe", {
-      probe_text: "work done\n\n❯ ",
-    });
-    assert.deepEqual(ready, {
-      kind: "report",
-      fields: { state: "idle", ready: true },
-    });
-    assert.deepEqual(
-      mapEvent("claude", "ReadyProbe", { probe_text: "✶ Working… (3s)" }),
-      { kind: "ignore" },
-    );
-    // Codex resting composer (evidence-backed rule): placeholder + footer,
-    // no working line. A bare calm line is still honestly unknown.
-    assert.deepEqual(
-      mapEvent("codex", "ReadyProbe", {
-        probe_text: "› Ask Codex to do anything\nGPT-6.1-Sol default · C:\\w\n← for agents · ? for shortcuts",
-      }),
-      { kind: "report", fields: { state: "idle", ready: true } },
-    );
-    assert.deepEqual(
-      mapEvent("codex", "ReadyProbe", {
-        probe_text: "› Ask Codex to do anything\nGPT-6.1-Sol default · C:\\w\n← for agents · ? for shortcuts\n◦ Working (1s • esc to interrupt)",
-      }),
-      { kind: "ignore" },
-    );
-    assert.deepEqual(mapEvent("claude", "ReadyProbe", { probe_text: "  " }), {
-      kind: "ignore",
-    });
+  it("Codex: herdr v9's SessionStart, UserPromptSubmit, Stop and Interrupt, plus PermissionRequest", () => {
+    assert.deepEqual(Object.keys(codexHooksJson(ids).hooks).sort(), [
+      "Interrupt",
+      "PermissionRequest",
+      "SessionStart",
+      "Stop",
+      "UserPromptSubmit",
+    ]);
   });
 });
 

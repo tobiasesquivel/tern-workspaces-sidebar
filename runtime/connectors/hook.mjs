@@ -1,67 +1,38 @@
 // runtime/connectors/hook.mjs — one-shot hook reporter for claude/codex.
 //
 // Ownership: ThirdConnectors. Invoked by the hooks that prepareLaunch()
-// installs (claude --settings file, codex CODEX_HOME hooks.json) with:
+// installs (claude --settings file, codex `-c hooks.*` session flags) with:
 //   node <connectorDir>/hook.mjs --agent claude|codex --event NAME
 // stdin: the hook event JSON (claude/codex documented schemas, verified
 // against https://code.claude.com/docs/en/hooks and
 // https://developers.openai.com/codex/hooks on 2026-10-12).
 //
-// Behavior per event (parent-corrected rules):
-// - SessionStart: identity only — report {state:"unknown", ready:false,
-//   session, session_epoch, session_start} (+ resume_argv). Never proves
-//   ready; readiness needs a prompt surface or a turn event.
-// - UserPromptSubmit: working.
-// - PermissionRequest: blocked + message (the ONLY generic tool-event block
-//   besides PreToolUse AskUserQuestion, elicitation, permission notifications).
-// - PreToolUse: blocked ONLY for AskUserQuestion tool (user question UI,
-//   confirmed by payload) — NEVER for any other tool.
-// - PostToolUse: working (turn continues; NOT idle).
-// - Stop: idle + ready:true (turn ended, prompt surface back).
-// - StopFailure / SessionEnd / Interrupt: release the occupant.
-// - Notification: blocked ONLY when notification_type is
-//   "permission_prompt" (or elicitation_* dialog types = Elicitation UI,
-//   confirmed); otherwise ignored (no report).
-// - Elicitation: blocked + message (MCP elicitation dialog = user question).
-// - PermissionDenied: recovery signal — ignored (no automatic state;
-//   a retry, if any, will surface as its own events).
-// - SubagentStart/SubagentStop (+ agent_id present on any event): ignored —
-//   subagent identity must never move the main pane occupant.
-// - Unknown event names: ignored (honest, no report).
+// As herdr does (research/herdr-agent-detection.md §1.3), the screen decides an
+// agent's state; hooks only add what the screen cannot know:
+// - SessionStart (both): identity only — the session ref, the resume argv and
+//   session_start. No state, no readiness.
+// - Codex v9 turn events: UserPromptSubmit → working, Stop → idle, Interrupt →
+//   idle. The daemon lets them win over the screen except for a visible blocker.
+// - Message hints (both): PermissionRequest, PreToolUse AskUserQuestion,
+//   Notification permission_prompt|elicitation_*, Elicitation. They report
+//   `{state:"blocked", hint:true, message}`: the daemon keeps the message for the
+//   next blocked screen and never takes the state from it. herdr installs none of
+//   these; the question text is what the screen cannot give.
+// - Everything else (Claude turn events, PostToolUse, SessionEnd, denials,
+//   subagent traffic, unknown names): ignored, no report.
 //
 // Cross-process seq: file-backed counter per (launch_id) under
 // <dataDir>/hooks/<launchId>.seq holding max(Date.now(), prev+1) so every
 // one-shot invocation grows the seq even across processes (satisfies the
 // core's per-source/launch monotonic gate). Session epochs likewise live in
-// <dataDir>/hooks/<launchId>.epoch: startup/resume/clear source keeps the
-// epoch, a changed session ref (id or transcript path) bumps it with
+// <dataDir>/hooks/<launchId>.epoch: a changed session ref bumps the epoch with
 // session_start:true; the old session never revives (core tombstones it).
-// request() (RuntimeCore client.mjs) is awaited before exit — reports are
-// never fire-and-forget from a one-shot hook.
-//
-// Parent corrections honored:
-// - PreToolUse→blocked is NEVER generic.
-// - PermissionDenied is recovery, not an automatic state.
-// - SessionStart proves identity, not readiness (state unknown, ready false).
-// - unknown is honest: unmapped events produce no report at all.
-// - This hook never approves or rejects anything (exit 0, no JSON decision
-//   output to the agent) — it only observes.
+// This hook never approves or rejects anything (exit 0, no JSON decision
+// output to the agent) — it only observes.
 
 import { promises as fs } from "node:fs";
-import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
-import { classifySurface } from "./detect.mjs";
-
-// Sync wrapper: detect.mjs classifySurface is sync; keep a local alias so
-// mapEvent stays pure-sync for tests (no async import inside the mapper).
-function classifySurfaceSync(agent, text) {
-  try {
-    return classifySurface(agent, text);
-  } catch {
-    return null;
-  }
-}
 
 const USAGE =
   "usage: node hook.mjs --agent claude|codex --event NAME [--data-dir DIR --launch-id ID --pane ID]";
@@ -83,8 +54,7 @@ function parseArgs(argv) {
       name === "--event" ||
       name === "--data-dir" ||
       name === "--launch-id" ||
-      name === "--pane" ||
-      name === "--probe-text"
+      name === "--pane"
     ) {
       out[name.slice(2)] = inline !== undefined ? inline : next();
       continue;
@@ -111,149 +81,66 @@ export function resolveRuntimeIdentity(opts = {}, env = process.env) {
   };
 }
 
-// Pure: map one hook event payload to a report/release action or null
-// (null = honestly ignore: subagent, recovery, unknown, unmapped).
-// Returns {kind:"report",fields} | {kind:"release"} | {kind:"ignore"}.
+// Pure: map one hook event payload to a report or an honest ignore.
+// Returns {kind:"report",fields} | {kind:"ignore"}.
 export function mapEvent(agent, eventName, payload = {}) {
   const event = eventName ?? payload.hook_event_name ?? null;
   if (typeof event !== "string" || event.length === 0) return { kind: "ignore" };
-  // Subagent traffic never moves the main pane occupant (claude agent_id,
-  // codex agent_id; codex Subagent* events likewise).
+  if (agent !== "claude" && agent !== "codex") return { kind: "ignore" };
+  // Subagent traffic never moves the main pane occupant (claude/codex agent_id,
+  // codex Subagent* events likewise).
   if (
     event === "SubagentStart" ||
     event === "SubagentStop" ||
-    (payload.agent_id !== undefined &&
-      payload.agent_id !== null &&
-      payload.agent_id !== "")
+    (payload.agent_id !== undefined && payload.agent_id !== null && payload.agent_id !== "")
   ) {
     return { kind: "ignore" };
   }
-
-  // Readiness probe (NOT a hook event — invoked by launch.mjs with the live
-  // pane surface). Reports idle+ready ONLY on real prompt evidence via
-  // classifySurface; anything else (working/blocked/unknown) is honestly
-  // ignored so start keeps waiting for real readiness. Never fabricates.
-  if (event === "ReadyProbe") {
-    if (agent !== "claude" && agent !== "codex") return { kind: "ignore" };
-    const text =
-      typeof payload.probe_text === "string"
-        ? payload.probe_text
-        : typeof payload.text === "string"
-          ? payload.text
-          : "";
-    if (text.trim().length === 0) return { kind: "ignore" };
-    const verdict = classifySurfaceSync(agent, text);
-    if (verdict !== null && verdict.state === "idle") {
-      return { kind: "report", fields: { state: "idle", ready: true } };
+  const hint = (message) => ({ kind: "report", fields: { state: "blocked", hint: true, message } });
+  switch (event) {
+    case "SessionStart": {
+      const session = sessionFromPayload(agent, payload);
+      const resume = resumeArgv(agent, payload, session);
+      return {
+        kind: "report",
+        fields: {
+          state: "unknown",
+          ready: false,
+          ...(session ? { session } : {}),
+          ...(resume ? { resume_argv: resume } : {}),
+          session_start: true,
+          ...(sessionRefChangedHint(payload) ? { epochBump: true } : {}),
+        },
+      };
     }
-    return { kind: "ignore" };
-  }
-
-  if (agent === "claude" || agent === "codex") {
-    switch (event) {
-      case "SessionStart": {
-        const session = sessionFromPayload(agent, payload);
-        const resume = resumeArgv(agent, payload, session);
-        return {
-          kind: "report",
-          fields: {
-            state: "unknown",
-            ready: false,
-            ...(session ? { session } : {}),
-            ...(resume ? { resume_argv: resume } : {}),
-            session_start: true,
-            ...(sessionRefChangedHint(payload) ? { epochBump: true } : {}),
-          },
-        };
-      }
-      case "UserPromptSubmit":
-        return { kind: "report", fields: { state: "working" } };
-      case "PermissionRequest": {
-        // Claude asks permission for its own question tool right after
-        // PreToolUse: show what was asked, not the permission for asking.
-        const message = isAskUserQuestion(agent, payload)
+    case "UserPromptSubmit":
+      return agent === "codex" ? { kind: "report", fields: { state: "working" } } : { kind: "ignore" };
+    case "Stop":
+    case "Interrupt":
+      return agent === "codex" ? { kind: "report", fields: { state: "idle" } } : { kind: "ignore" };
+    case "PermissionRequest":
+      // Claude asks permission for its own question tool right after PreToolUse:
+      // the hint is what was asked, not the permission for asking it.
+      return hint(
+        isAskUserQuestion(agent, payload)
           ? (questionFromAskPayload(payload) ?? "question asked")
-          : (questionFromPermissionPayload(payload) ?? "permission requested");
-        return {
-          kind: "report",
-          fields: { state: "blocked", message },
-        };
+          : (questionFromPermissionPayload(payload) ?? "permission requested"),
+      );
+    case "PreToolUse":
+      if (!isAskUserQuestion(agent, payload)) return { kind: "ignore" };
+      return hint(questionFromAskPayload(payload) ?? "question asked");
+    case "Notification": {
+      const t = payload.notification_type ?? payload.notificationType ?? null;
+      if (t === "permission_prompt" || t === "elicitation_dialog" || t === "elicitation_url_dialog") {
+        return hint(messageFromPayload(payload) ?? "permission requested");
       }
-      case "PreToolUse": {
-        // ONLY AskUserQuestion (user-facing question UI, payload-confirmed).
-        if (!isAskUserQuestion(agent, payload)) return { kind: "ignore" };
-        return {
-          kind: "report",
-          fields: {
-            state: "blocked",
-            message: questionFromAskPayload(payload) ?? "question asked",
-          },
-        };
-      }
-      case "PostToolUse":
-        return { kind: "report", fields: { state: "working" } };
-      case "PostToolUseFailure":
-        return { kind: "report", fields: { state: "working", failed: true } };
-      case "Stop":
-        return { kind: "report", fields: { state: "idle", ready: true } };
-      case "StopFailure":
-        // Turn died on API error: mark failed but stay reportable (the
-        // agent is still alive and may retry). Never release from a hook:
-        // only the wrapper (post child-exit) owns release.
-        return { kind: "report", fields: { state: "unknown", failed: true } };
-      case "Notification": {
-        const t = payload.notification_type ?? payload.notificationType ?? null;
-        if (
-          t === "permission_prompt" ||
-          t === "elicitation_dialog" ||
-          t === "elicitation_url_dialog"
-        ) {
-          return {
-            kind: "report",
-            fields: {
-              state: "blocked",
-              message: messageFromPayload(payload) ?? "permission requested",
-            },
-          };
-        }
-        return { kind: "ignore" };
-      }
-      case "Elicitation":
-      case "ElicitationResult":
-        return {
-          kind: "report",
-          fields: {
-            state: "blocked",
-            message:
-              messageFromPayload(payload, [
-                "message",
-                "prompt",
-                "question",
-                "title",
-              ]) ?? "input requested",
-          },
-        };
-      // SessionEnd/Interrupt NEVER release from a hook: Interrupt is a
-      // turn-cancel (agent stays live); SessionEnd can be /clear/resume/switch
-      // with the next SessionStart arriving on the same occupant (identity
-      // ending events report unknown+not-ready, keeping name/session/resume).
-      // Only the wrapper releases, after the child truly exits. Unknown
-      // reasons stay honest: ignore, no state change.
-      case "SessionEnd": {
-        if (isIdentityEnding(payload)) {
-          return { kind: "report", fields: { state: "unknown", ready: false } };
-        }
-        return { kind: "ignore" };
-      }
-      case "Interrupt":
-        // Cancelled turn: back to unknown (agent live, prompt evidence comes
-        // from the next surface/Stop — never fabricate idle here).
-        return { kind: "report", fields: { state: "unknown" } };
-      default:
-        return { kind: "ignore" };
+      return { kind: "ignore" };
     }
+    case "Elicitation":
+      return hint(messageFromPayload(payload, ["message", "prompt", "question", "title"]) ?? "input requested");
+    default:
+      return { kind: "ignore" };
   }
-  return { kind: "ignore" };
 }
 
 function sessionFromPayload(agent, payload) {
@@ -282,18 +169,6 @@ function sessionRefChangedHint(payload) {
   const source = payload.source ?? null;
   return source === "resume" || source === "fork" || source === "clear";
 }
-// SessionEnd reasons, per primary docs (claude hooks ref: clear/resume/logout/
-// prompt_input_exit/other; codex hooks ref: reason always "other" today).
-// Identity-ending (process actually going away): logout and prompt_input_exit
-// (user exits the CLI). clear/resume/other/compact keep the process alive —
-// the next SessionStart arrives on the same occupant, so the hook must NOT
-// release (only the wrapper releases, after the child truly exits).
-// Unknown/absent reasons stay honest: not identity-ending, no state change.
-export function isIdentityEnding(payload = {}) {
-  const reason = payload.reason ?? null;
-  return reason === "logout" || reason === "prompt_input_exit";
-}
-
 
 // The command that resumes this session in a fresh shell: argv[0] is the bare name
 // on PATH, as omp's `resume_argv` is (`omp --resume=<ref>`).
@@ -372,118 +247,6 @@ function questionFromAskPayload(payload) {
     }
   }
   return messageFromPayload(payload, ["question", "prompt", "message", "text"]);
-}
-
-// ---- per-launch pending-blocker store --------------------------------------
-// Parallel tool calls need per-tool resolution: PostToolUse(B) must not clear
-// a blocked question from AskUserQuestion(A). Hooks carry real correlation
-// ids (claude: tool_use_id on Pre/Post/PermissionDenied; elicitation_id on
-// Elicitation/ElicitationResult; codex: turn-scoped tool ids where present).
-// The store is file-backed per launch (<dataDir>/hooks/<launch>.blockers.json,
-// bounded) so parallel one-shot hook processes serialize through it.
-
-export const MAX_BLOCKERS = 32;
-
-// Pure: correlation id for a blocker-creating event, or null when the payload
-// carries none (falls back to tool-name matching at report time).
-export function blockerIdFor(event, payload = {}) {
-  if (payload.tool_use_id !== undefined && payload.tool_use_id !== null && String(payload.tool_use_id).length > 0) {
-    return `tool:${payload.tool_use_id}`;
-  }
-  if (payload.elicitation_id !== undefined && payload.elicitation_id !== null && String(payload.elicitation_id).length > 0) {
-    return `elicitation:${payload.elicitation_id}`;
-  }
-  if (event === "Elicitation" || event === "ElicitationResult") {
-    const server = payload.mcp_server_name ?? payload.mcp_server ?? null;
-    if (typeof server === "string" && server.length > 0) return `elicitation-server:${server}`;
-  }
-  const tool = payload.tool_name ?? payload.tool ?? null;
-  if ((event === "PermissionRequest" || event === "PreToolUse") && typeof tool === "string" && tool.length > 0) {
-    return `tool-name:${tool}`;
-  }
-  return null;
-}
-
-// SessionStart with a new epoch resets old blockers (old-session events must
-// neither add nor clear current blockers). resetBlockers is called with the
-// fresh epoch right after epochForSession bumps it.
-async function readBlockers(dataDir, launchId) {
-  const file = join(hooksDir(dataDir), `${safeLaunchFile(launchId)}.blockers.json`);
-  try {
-    const parsed = JSON.parse(await fs.readFile(file, "utf8"));
-    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) return parsed;
-  } catch {
-    // Missing/corrupt: start empty.
-  }
-  return {};
-}
-
-async function writeBlockers(dataDir, launchId, store) {
-  const dir = hooksDir(dataDir);
-  await fs.mkdir(dir, { recursive: true });
-  const file = join(dir, `${safeLaunchFile(launchId)}.blockers.json`);
-  const entries = Object.entries(store).slice(-MAX_BLOCKERS);
-  const tmp = `${file}.tmp-${process.pid}`;
-  await fs.writeFile(tmp, JSON.stringify(Object.fromEntries(entries)), "utf8");
-  await fs.rename(tmp, file);
-  return Object.fromEntries(entries);
-}
-
-// Reset blockers on a new session epoch. Called from main() right after
-// epochForSession reports a bumped epoch (new SessionStart identity).
-export async function resetBlockers(dataDir, launchId) {
-  await writeBlockers(dataDir, launchId, {});
-}
-// Register a pending blocker. Returns the stored entry.
-export async function addBlocker(dataDir, launchId, id, detail = {}) {
-  const store = await readBlockers(dataDir, launchId);
-  const entry = {
-    id,
-    tool: typeof detail.tool === "string" ? detail.tool : null,
-    message: typeof detail.message === "string" ? detail.message : null,
-    at: Date.now(),
-  };
-  store[id] = entry;
-  await writeBlockers(dataDir, launchId, store);
-  return entry;
-}
-
-// Resolve blockers matching an event: exact id wins; tool_use_id always exact;
-// elicitation results match elicitation ids or same-server entries; PostToolUse
-// matches ONLY the same tool_use_id (never an unrelated pending blocker).
-// Returns {resolved: string[], remaining: Record}.
-export async function resolveBlockers(dataDir, launchId, event, payload = {}) {
-  const store = await readBlockers(dataDir, launchId);
-  const ids = Object.keys(store);
-  if (ids.length === 0) return { resolved: [], remaining: store };
-  const resolved = [];
-  const id = blockerIdFor(event, payload);
-  const toolUseId = payload.tool_use_id != null ? String(payload.tool_use_id) : null;
-  if (id !== null && store[id] !== undefined) {
-    resolved.push(id);
-  } else if (event === "PostToolUse" || event === "PostToolUseFailure") {
-    // Completion without a matching id resolves NOTHING: an unrelated turn
-    // finishing must not clear a still-open question (the parent invariant).
-    // tool_use_id present but unknown => likewise nothing.
-  } else if (event === "ElicitationResult") {
-    const server = payload.mcp_server_name ?? payload.mcp_server ?? null;
-    for (const key of ids) {
-      if (key === id || (typeof server === "string" && store[key] && store[key].server === server)) {
-        resolved.push(key);
-      }
-    }
-  } else if (event === "PermissionDenied" && toolUseId !== null) {
-    const key = `tool:${toolUseId}`;
-    if (store[key] !== undefined) resolved.push(key);
-  }
-  if (resolved.length === 0) return { resolved: [], remaining: store };
-  for (const key of resolved) delete store[key];
-  await writeBlockers(dataDir, launchId, store);
-  return { resolved, remaining: store };
-}
-
-export async function pendingBlockers(dataDir, launchId) {
-  return readBlockers(dataDir, launchId);
 }
 
 function hooksDir(dataDir) {
@@ -597,11 +360,7 @@ async function main() {
   }
 
   let payload = {};
-  // ReadyProbe carries everything in --probe-text; never touch stdin there
-  // (a prober spawn without a pipe would block forever reading it).
-  const skipStdin =
-    event === "ReadyProbe" || (process.stdin && process.stdin.isTTY === true);
-  if (!skipStdin) {
+  if (!(process.stdin && process.stdin.isTTY === true)) {
     try {
       const raw = await readStdin();
       payload = raw.trim().length > 0 ? JSON.parse(raw) : {};
@@ -609,79 +368,8 @@ async function main() {
       payload = {};
     }
   }
-
-  // ReadyProbe carries its surface as --probe-text (launch.mjs prober);
-  // hook events carry theirs on stdin JSON.
-  if (event === "ReadyProbe" && typeof parsed["probe-text"] === "string") {
-    payload.probe_text = parsed["probe-text"];
-  }
   const action = mapEvent(agent, event, payload);
   if (action.kind === "ignore") process.exit(0);
-
-  // Per-tool blocker tracking (parallel tool calls): register on block,
-  // gate completions on matching ids. Pure mapEvent decides the state;
-  // the store only decides whether a completion clears it.
-  const blockerEvents = new Set([
-    "PermissionRequest",
-    "PreToolUse",
-    "Elicitation",
-    "Notification",
-  ]);
-  const resolutionEvents = new Set([
-    "PostToolUse",
-    "PostToolUseFailure",
-    "PermissionDenied",
-    "ElicitationResult",
-    "Stop",
-  ]);
-  if (blockerEvents.has(event) && action.kind === "report" && action.fields?.state === "blocked") {
-    const id = blockerIdFor(event, payload);
-    if (id !== null) {
-      await addBlocker(dataDir, launchId, id, {
-        tool: payload.tool_name ?? payload.tool ?? null,
-        message: action.fields.message ?? null,
-        ...(payload.mcp_server_name ? { server: payload.mcp_server_name } : {}),
-      }).catch(() => null);
-    }
-  } else if (resolutionEvents.has(event)) {
-    const { resolved, remaining } = await resolveBlockers(dataDir, launchId, event, payload).catch(() => ({
-      resolved: [],
-      remaining: null,
-    }));
-    const matchedOwn = resolved.length > 0;
-    // ANY remaining pending blocker keeps `blocked`, regardless of how many
-    // this event resolved: a resolved A must not clear a still-open B question.
-    const pendingKeys = remaining !== null ? Object.keys(remaining) : [];
-    if (event === "PostToolUse" || event === "PostToolUseFailure") {
-      if (pendingKeys.length > 0) {
-        const first = remaining[pendingKeys[0]];
-        action.kind = "report";
-        action.fields = { state: "blocked", message: first?.message ?? "awaiting input" };
-      }
-    } else if (event === "PermissionDenied") {
-      // Denial resolves ONLY its own pending request (same tool_use_id):
-      // resolveBlockers already removed exactly that id. Anything still
-      // pending keeps `blocked`; a lone matched denial leaves unknown
-      // (turn needs input/retry — never infer working); no match at all
-      // is an honest ignore.
-      if (pendingKeys.length > 0) {
-        const first = remaining[pendingKeys[0]];
-        action.fields = { state: "blocked", message: first?.message ?? "awaiting input" };
-      } else if (matchedOwn) {
-        action.fields = { state: "unknown" };
-      } else {
-        process.exit(0);
-      }
-    } else if (event === "ElicitationResult") {
-      // Answered elicitation resolves its own id; other pending blockers stay.
-      if (pendingKeys.length > 0) {
-        const first = remaining[pendingKeys[0]];
-        action.kind = "report";
-        action.fields = { state: "blocked", message: first?.message ?? "awaiting input" };
-      }
-      // else: fall through to mapEvent's own resolution (turn continues).
-    }
-  }
 
   let request;
   try {
@@ -700,9 +388,7 @@ async function main() {
   }
   let sessionEpoch = 0;
   let sessionStart = fields.session_start === true;
-  let epochBumped = false;
   if (fields.session) {
-    const prevEpoch = await currentEpoch(dataDir, launchId).catch(() => 0);
     try {
       const e = await epochForSession(
         dataDir,
@@ -712,16 +398,14 @@ async function main() {
       );
       sessionEpoch = e.epoch;
       sessionStart = e.session_start;
-      epochBumped = e.epoch > prevEpoch;
     } catch {
       sessionEpoch = 0;
       sessionStart = fields.session_start === true;
     }
-    // New session identity resets old blockers BEFORE any blocker mutation:
-    // old-session events must neither add nor clear current blockers.
-    if (epochBumped) {
-      await resetBlockers(dataDir, launchId).catch(() => null);
-    }
+  } else {
+    // A report without a session rides the current epoch: the core rejects
+    // any other one as stale.
+    sessionEpoch = await currentEpoch(dataDir, launchId).catch(() => 0);
   }
   const { epochBump: _drop, ...rest } = fields;
   void _drop;

@@ -1,0 +1,67 @@
+# Tern overlay for herdr's codex.toml: rules appended after herdr's, with the same
+# engine (runtime/connectors/manifest.mjs). Each one is backed by a lab capture
+# (codex-cli 0.159.1, `tern capture --surfaces`).
+id = "tern-codex"
+version = "2026.10.14.1"
+
+# First run with hooks codex has not trusted yet: a numbered picker the agent cannot
+# get past until the user answers.
+[[rules]]
+id = "codex_hooks_review"
+state = "blocked"
+priority = 950
+region = "whole_recent"
+visible_blocker = true
+contains = ["Hooks need review"]
+any = [
+  { contains = ["Review hooks"] },
+  { contains = ["Trust all and continue"] },
+  { contains = ["Continue without trusting"] },
+]
+all = [
+  { any = [
+    { contains = ["enter confirm"] },
+    { contains = ["esc skip"] },
+    { contains = ["enter select"] },
+    { contains = ["esc back"] },
+  ] },
+]
+
+# First run on Windows before any sandbox exists.
+[[rules]]
+id = "codex_sandbox_setup"
+state = "blocked"
+priority = 950
+region = "whole_recent"
+visible_blocker = true
+contains = ["Set up the Codex agent sandbox"]
+any = [
+  { contains = ["Set up default sandbox"] },
+  { contains = ["Use non-admin sandbox"] },
+]
+all = [
+  { any = [
+    { contains = ["enter select"] },
+    { contains = ["esc back"] },
+    { contains = ["enter continue"] },
+  ] },
+]
+
+# The resting composer. herdr's visible idle for codex is its OSC title; when Tern
+# has no title for the pane, this is the visible evidence instead. Lowest priority:
+# any working or blocked rule wins, and a live timer or spinner on screen excludes it.
+[[rules]]
+id = "codex_composer_idle"
+state = "idle"
+priority = 90
+region = "whole_recent"
+visible_idle = true
+contains = ["? for shortcuts"]
+line_regex = ['^› Ask Codex to do anything\s*$']
+not = [
+  { regex = ['(?:^| )[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏](?: |$)'] },
+  { regex = ['Worked for \d'] },
+  { contains = ["Hook failed"] },
+  { contains = [" to interrupt)"] },
+  { regex = ['\(\d+[smh]\)'] },
+]

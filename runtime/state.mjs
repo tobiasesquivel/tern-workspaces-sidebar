@@ -13,6 +13,18 @@
 // tab/workspace/cwd, failed, release, sweep) advances the global _seq so
 // persist() ships it; activity-only bumps also move state_change_seq, while
 // enrich-only changes (seen flips, meta enrichment) move _seq alone.
+//
+// Where each agent's state comes from (herdr, research/herdr-agent-detection.md
+// §1): omp — its extension's reports (full lifecycle); the screen is read only
+// while `start` waits, for a startup dialog. Claude — the screen (`detect`, from
+// the daemon's detection loop); its hooks bring identity and a message hint,
+// never a state. Codex — its v9 hooks (UserPromptSubmit working, Stop/Interrupt
+// idle) win over the screen except for a visible blocker read no earlier than
+// the hook; the screen covers everything before the first hook. Every state
+// change goes through `_setState`: herdr's seen rule (any non-idle state is
+// seen), completion (working|blocked → idle, suppressed while the agent is
+// still being acquired or launched) and the transition listeners (the
+// daemon's notifier).
 
 import { randomBytes } from "node:crypto";
 
@@ -33,6 +45,9 @@ const SOURCE_AGENT = {
 const INTERNAL_STATES = new Set(["idle", "working", "blocked", "unknown"]);
 const NAME_RE = /^[a-z][a-z0-9_-]{0,31}$/;
 const MAX_RESUME_ARGS = 64;
+// A hook's message names the next blocked screen only while this fresh: an
+// older one belongs to a dialog that already went away unseen.
+const HINT_FRESH_MS = 30000;
 const MAX_RESUME_BYTES = 8192;
 
 function newGeneration() {
@@ -109,6 +124,214 @@ export class RuntimeState {
     this._obsGen = new Map();
     this._focusedPane = null;
     this._focusedTab = null;
+    // Transition listeners (the daemon's notifier): called after each change.
+    this._listeners = [];
+    // Panes the process probe found back at a free shell: a stale native list
+    // must not bring their agent back until an agent is seen there again.
+    this._free = new Set();
+  }
+
+  onTransition(fn) {
+    if (typeof fn === "function") this._listeners.push(fn);
+  }
+
+  // Fields every occupant carries besides its public ones.
+  _withInternals(o) {
+    o.acq = o.acq ?? true; // herdr agent_process_acquisition_pending
+    o.screen = o.screen ?? null; // last screen read: {state, visible_blocker, rule, at}
+    o.hook = o.hook ?? null; // Codex hook authority: {state, at}
+    o.hint = o.hint ?? null; // a hook's message for the next blocked screen: {message, at}
+    // omp started by `start`: its ready waits for a clean startup screen.
+    o.startup_gate = o.startup_gate ?? (o.agent === "omp" && !o.native ? "pending" : "clear");
+    o.reported_ready = o.reported_ready ?? false;
+    return o;
+  }
+
+  // The one place a state changes. Returns true when it did.
+  _setState(o, next) {
+    const prev = o.state;
+    if (next === prev) return false;
+    this._seq += 1;
+    o.state = next;
+    o.state_change_seq = this._seq;
+    let completion = false;
+    if (next !== "idle") o.seen = true;
+    // A Claude/Codex still launching (no idle screen yet) finishes no turn: its
+    // startup dialogs are not work (deviation from herdr, measured: a one-read
+    // flicker of `working` between Codex's dialogs ended the acquisition).
+    const launching = o.agent !== "omp" && o.launch_pending;
+    if ((prev === "working" || prev === "blocked") && next === "idle" && !o.acq && !launching) {
+      completion = true;
+      o.completion_seq = o.state_change_seq;
+      o.seen = this._isSeen(o.pane_id, o.tab_id);
+    } else {
+      o.completion_seq = null;
+    }
+    if (next === "working" || next === "idle") o.acq = false;
+    for (const fn of this._listeners) {
+      try {
+        fn({
+          pane_id: o.pane_id,
+          terminal_id: o.terminal_id,
+          agent: o.agent,
+          prev,
+          next,
+          completion,
+          seen: o.seen,
+        });
+      } catch {
+        // a listener never breaks arbitration
+      }
+    }
+    return true;
+  }
+
+  // Claude/Codex (and omp's startup gate): the effective state from the screen
+  // and the hook. Returns true when anything public changed.
+  _recompute(o) {
+    let rev = false;
+    let next = o.state;
+    let message = o.message;
+    if (o.agent === "omp") {
+      if (o.native || o.startup_gate === "clear") return false;
+      const sc = o.screen;
+      if (sc && sc.state === "blocked" && sc.visible_blocker) {
+        o.startup_gate = "blocked";
+        next = "blocked";
+        message = sc.rule ?? "awaiting input";
+      } else if (sc && sc.state === "idle" && sc.visible_idle) {
+        // omp's own prompt on screen (positive evidence: its splash matches no
+        // rule). A startup dialog answered is still the agent's acquisition,
+        // never a finished turn.
+        if (o.startup_gate === "blocked") o.acq = true;
+        o.startup_gate = "clear";
+        next = o.reported_state ?? o.state;
+        if (o.state === "blocked" && o.reported_state !== "blocked") message = o.reported_message ?? null;
+      }
+    } else {
+      const sc = o.screen;
+      const hk = o.hook;
+      if (hk && sc && sc.state === "blocked" && sc.visible_blocker && sc.at >= hk.at && hk.state !== "blocked") {
+        next = "blocked";
+      } else if (hk) {
+        next = hk.state;
+      } else if (sc) {
+        next = sc.state;
+      }
+      if (next === "blocked") {
+        const fresh = o.hint && this._now() - o.hint.at <= HINT_FRESH_MS;
+        message = fresh ? o.hint.message : (o.state === "blocked" && o.message ? o.message : (sc?.rule ?? "awaiting input"));
+      } else if (o.state === "blocked") {
+        message = null;
+        o.hint = null;
+      }
+    }
+    if (message !== o.message) {
+      o.message = message;
+      rev = true;
+    }
+    if (!this._setState(o, next) && rev) this._seq += 1;
+    // Readiness (herdr Pending → Active): Claude/Codex idle on screen; omp's
+    // extension ready with a clean startup screen.
+    const ready = o.agent === "omp" ? o.reported_ready && o.startup_gate === "clear" : o.state === "idle";
+    if (o.launch_pending && ready) {
+      o.interactive_ready = true;
+      o.launch_pending = false;
+      this._seq += 1;
+    }
+  }
+
+  // A new identity minted by a report (session_start): Claude/Codex take no state
+  // from it and wait for their screen; omp keeps what its extension said.
+  _adopt(o, r) {
+    if (o.agent === "omp") {
+      o.reported_state = o.state;
+      o.reported_message = o.message;
+      o.reported_ready = r.ready === true;
+      o.interactive_ready = false;
+      o.launch_pending = true;
+      this._withInternals(o);
+      if (o.reported_ready && o.startup_gate === "clear") {
+        o.interactive_ready = true;
+        o.launch_pending = false;
+      }
+      return o;
+    }
+    o.state = "unknown";
+    o.message = null;
+    o.interactive_ready = false;
+    o.launch_pending = true;
+    this._withInternals(o);
+    this._takeHook(o, r);
+    this._recompute(o);
+    return o;
+  }
+
+  // What a Claude/Codex report may change: the Codex hook authority, or a hint.
+  _takeHook(o, r) {
+    if (r.hint === true) {
+      if (r.state === "blocked" && typeof r.message === "string" && r.message.length > 0) {
+        o.hint = { message: r.message, at: this._now() };
+      }
+      return;
+    }
+    if (o.agent === "codex" && (r.state === "working" || r.state === "idle")) {
+      o.hook = { state: r.state, at: this._now() };
+    }
+  }
+
+  // ---- detect: one screen read from the daemon's detection loop -------------
+  // d: {agent, state, visible_blocker?, visible_idle?, rule?, at?}. Applies to the
+  // pane's occupant of that agent: claude/codex always, omp only while its
+  // startup gate is open. Returns true when anything public changed.
+  detect(paneId, d = {}) {
+    const o = this._agents.get(paneId);
+    if (!o || !d || o.agent !== d.agent) return false;
+    if (!INTERNAL_STATES.has(d.state)) return false;
+    if (o.agent === "omp" && (o.native || o.startup_gate === "clear")) return false;
+    o.screen = {
+      state: d.state,
+      visible_blocker: d.visible_blocker === true && d.state === "blocked",
+      visible_idle: d.visible_idle === true && d.state === "idle",
+      rule: typeof d.rule === "string" ? d.rule : null,
+      at: typeof d.at === "number" ? d.at : this._now(),
+    };
+    const before = this._seq;
+    this._recompute(o);
+    return this._seq !== before;
+  }
+
+  // ---- releaseNative: the process probe found the pane back at its shell ----
+  // Drops a native occupant (never a connector: its wrapper releases it) and
+  // keeps a stale native list from bringing it back until clearFree.
+  releaseNative(paneId) {
+    const o = this._agents.get(paneId);
+    if (!o || o.native !== true) return false;
+    this._agents.delete(paneId);
+    this._free.add(paneId);
+    this._seq += 1;
+    return true;
+  }
+
+  // An agent process seen again in the pane: natives may come back.
+  clearFree(paneId) {
+    this._free.delete(paneId);
+  }
+
+  // Raw occupant fields the daemon's loops need (never shipped).
+  peek(paneId) {
+    const o = this._agents.get(paneId);
+    if (!o) return null;
+    return {
+      pane_id: o.pane_id,
+      terminal_id: o.terminal_id,
+      agent: o.agent,
+      native: o.native === true,
+      launch_pending: o.launch_pending === true,
+      startup_gate: o.startup_gate,
+      agent_status: this._deriveStatus(o),
+      screen: o.screen ? { ...o.screen } : null,
+    };
   }
 
   get generation() {
@@ -216,7 +439,10 @@ export class RuntimeState {
       agent,
       source: `tern:${agent}`,
       native: false,
-      state: "idle",
+      // omp's extension reports from its first event; Claude and Codex are
+      // unknown until their screen is read (herdr: unknown until the first
+      // read after the startup grace).
+      state: agent === "omp" ? "idle" : "unknown",
       message: null,
       interactive_ready: false,
       launch_pending: true,
@@ -231,7 +457,7 @@ export class RuntimeState {
       tab_id: null,
       cwd: null,
     };
-    this._agents.set(pane_id, occupant);
+    this._agents.set(pane_id, this._withInternals(occupant));
     return this._public(occupant);
   }
 
@@ -322,7 +548,7 @@ export class RuntimeState {
         tab_id: null,
         cwd: null,
       };
-      this._agents.set(pane_id, occupant);
+      this._agents.set(pane_id, this._adopt(occupant, r));
       this._seqByKey.set(key, seq);
       return { accepted: true, agent: this._public(occupant) };
     }
@@ -356,7 +582,7 @@ export class RuntimeState {
         tab_id: cur.tab_id,
         cwd: cur.cwd,
       };
-      this._agents.set(pane_id, occupant);
+      this._agents.set(pane_id, this._adopt(occupant, r));
       this._seqByKey.set(key, seq);
       return { accepted: true, agent: this._public(occupant) };
     }
@@ -388,7 +614,7 @@ export class RuntimeState {
         tab_id: cur.tab_id,
         cwd: cur.cwd,
       };
-      this._agents.set(pane_id, occupant);
+      this._agents.set(pane_id, this._adopt(occupant, r));
       this._seqByKey.set(key, seq);
       return { accepted: true, agent: this._public(occupant) };
     }
@@ -421,13 +647,30 @@ export class RuntimeState {
       cur.session_epoch = session_epoch;
     }
 
+    const prevResumeKey = cur.resume_argv ? JSON.stringify(cur.resume_argv) : null;
+    const nextResume = resumeProvided ? resume : cur.resume_argv;
+    const nextResumeKey = nextResume ? JSON.stringify(nextResume) : null;
+    const nextFailed = failedProvided ? r.failed === true : cur.failed;
+
+    if (agent !== "omp") {
+      // Claude/Codex: identity, resume, failure, the Codex hook and hints. The
+      // state is the screen's (and Codex's hook), arbitrated in _recompute.
+      const rev = refChanged || nextResumeKey !== prevResumeKey || nextFailed !== cur.failed;
+      cur.resume_argv = nextResume ?? null;
+      cur.failed = nextFailed;
+      cur.hasReported = true;
+      this._takeHook(cur, r);
+      const before = this._seq;
+      this._recompute(cur);
+      if (rev && this._seq === before) this._seq += 1;
+      this._seqByKey.set(key, seq);
+      return { accepted: true, agent: this._public(cur) };
+    }
+
     const prevState = cur.state;
     const prevMessage = cur.message;
     const prevFailed = cur.failed;
     const prevReady = cur.interactive_ready;
-    const prevResumeKey = cur.resume_argv ? JSON.stringify(cur.resume_argv) : null;
-    const nextResume = resumeProvided ? resume : cur.resume_argv;
-    const nextResumeKey = nextResume ? JSON.stringify(nextResume) : null;
     // Blocker reason is current, never stale: leaving blocked for
     // working/idle without a new message clears the old blocker text (the
     // question was resolved; the payload omits message when there is nothing
@@ -435,29 +678,29 @@ export class RuntimeState {
     // last_message transcript is a different field, untouched.
     const leavingBlocked = prevState === "blocked" && state !== "blocked";
     const nextMessage = messageProvided ? message : (leavingBlocked ? null : cur.message);
-    const nextFailed = failedProvided ? r.failed === true : cur.failed;
-    const nextReady = readyProvided ? r.ready === true : cur.interactive_ready;
-    const changed =
-      state !== prevState ||
-      nextMessage !== prevMessage ||
+    const reportedReady = readyProvided ? r.ready === true : cur.reported_ready;
+    cur.reported_state = state;
+    cur.reported_message = nextMessage;
+    cur.reported_ready = reportedReady;
+    // A startup dialog on screen holds the pane blocked until it goes away.
+    const held = cur.startup_gate === "blocked";
+    const nextReady = reportedReady && cur.startup_gate === "clear";
+    const other =
+      (!held && nextMessage !== prevMessage) ||
       nextFailed !== prevFailed ||
       nextReady !== prevReady ||
       nextResumeKey !== prevResumeKey ||
       refChanged;
-    cur.state = state;
-    cur.message = nextMessage;
+    if (!held) cur.message = nextMessage;
     cur.failed = nextFailed;
     cur.interactive_ready = nextReady;
     cur.launch_pending = !nextReady;
     cur.resume_argv = nextResume ?? null;
     cur.hasReported = true;
-    if (changed) {
+    const moved = !held && this._setState(cur, state);
+    if (!moved && other) {
       this._seq += 1;
       cur.state_change_seq = this._seq;
-      if ((prevState === "working" || prevState === "blocked") && state === "idle") {
-        cur.completion_seq = cur.state_change_seq;
-        cur.seen = this._isSeen(pane_id, cur.tab_id);
-      }
     }
     this._seqByKey.set(key, seq);
     return { accepted: true, agent: this._public(cur) };
@@ -603,69 +846,15 @@ export class RuntimeState {
             rev = true;
           }
           if (meta.cwd !== null && meta.cwd !== cur.cwd) { cur.cwd = meta.cwd; rev = true; }
-          // Readiness is state-only AND state-scoped: the hint applies only
-          // while the reported state is unknown|idle. A known working state
-          // dominates a contradictory idle surface (same as blocked): the
-          // reporter owns classified states, the surface only resolves the
-          // unclassified (unknown) or confirms the already-idle.
-          // Revision vs activity: metadata/readiness flips move the snapshot
-          // revision (_seq) so the aside sees them, but they NEVER touch
-          // state_change_seq — the CLI stalled/activity gate must only fire
-          // on credible state changes, never on focused-metadata churn.
-          const readyHint = b.ready === true || mapped === "idle";
-          if (readyHint && cur.launch_pending && (cur.state === "unknown" || cur.state === "idle")) {
-            cur.interactive_ready = true;
-            cur.launch_pending = false;
-            rev = true;
-          }
-          if (mapped === "idle" && cur.state === "unknown") {
-            cur.state = "idle";
-            this._seq += 1;
-            cur.state_change_seq = this._seq;
-          }
-          // Surface blocker with motive: a pending occupant with no evidence
-          // yet — unknown, or the claim's own idle before any report (codex's
-          // folder-trust dialog comes before any hook) — facing a classified
-          // dialog (rule id as message) becomes blocked WITH its reason, so
-          // start resolves to blocked+motivo instead of timeout. working stays
-          // dominant and a reported blocked keeps its connector message.
-          const noEvidence = cur.state === "unknown" || (cur.state === "idle" && cur.launch_pending && !cur.hasReported);
-          if (mapped === "blocked" && noEvidence) {
-            cur.state = "blocked";
-            if (typeof b.message === "string" && b.message.length > 0) cur.message = b.message;
-            this._seq += 1;
-            cur.state_change_seq = this._seq;
-          }
-          // A surface blocker that is still the only evidence follows the screen:
-          // the next startup dialog replaces its reason (no report came in yet).
-          else if (
-            mapped === "blocked" &&
-            cur.state === "blocked" &&
-            cur.launch_pending &&
-            !cur.hasReported &&
-            typeof b.message === "string" &&
-            b.message.length > 0 &&
-            b.message !== cur.message
-          ) {
-            cur.message = b.message;
-            rev = true;
-          }
+          // The native surface never decides a connector: its reports (omp) or
+          // its screen (Claude/Codex, the detection loop) do. Readiness too:
+          // a native idle once made an omp inside its setup wizard look ready.
           continue;
         }
-        const prevState = cur.state;
         const prevTab = cur.tab_id;
         const prevWs = cur.workspace_id;
         const prevCwd = cur.cwd;
         const prevFailed = cur.failed;
-        const nextMessage =
-          typeof b.last_message === "string"
-            ? b.last_message
-            : typeof b.message === "string"
-              ? b.message
-              : cur.message;
-        const changed = mapped !== prevState || nextMessage !== cur.message;
-        cur.state = mapped;
-        cur.message = nextMessage ?? null;
         if (meta.tab_id !== null) cur.tab_id = meta.tab_id;
         if (meta.workspace_id !== null) cur.workspace_id = meta.workspace_id;
         if (meta.cwd !== null) cur.cwd = meta.cwd;
@@ -678,18 +867,27 @@ export class RuntimeState {
         ) {
           rev = true;
         }
-        if (changed) {
+        // A native Claude/Codex follows its screen (detect), not a list.
+        if (cur.agent !== "omp") continue;
+        const nextMessage =
+          typeof b.last_message === "string"
+            ? b.last_message
+            : typeof b.message === "string"
+              ? b.message
+              : cur.message;
+        const msgChanged = (nextMessage ?? null) !== cur.message;
+        cur.message = nextMessage ?? null;
+        if (!this._setState(cur, mapped) && msgChanged) {
           this._seq += 1;
           cur.state_change_seq = this._seq;
-          if ((prevState === "working" || prevState === "blocked") && mapped === "idle") {
-            cur.completion_seq = cur.state_change_seq;
-            cur.seen = this._isSeen(pane, meta.tab_id ?? cur.tab_id);
-          }
         }
         continue;
       }
       const kind = nativeAgent(b);
       if (kind === null) continue; // no known source: never invent an occupant
+      // The process probe found this pane back at its shell: a stale list does
+      // not bring the agent back (cleared when an agent is seen there again).
+      if (this._free.has(pane)) continue;
       this._seq += 1;
       // Initial idle is never a completion: without a witnessed
       // working/blocked -> idle transition there is no completion_seq, so a
@@ -721,6 +919,8 @@ export class RuntimeState {
         tab_id: meta.tab_id ?? (typeof b.tab === "number" ? b.tab : (typeof b.tab_id === "number" ? b.tab_id : null)),
         cwd: typeof b.cwd === "string" ? b.cwd : (meta.cwd ?? null),
       };
+      this._withInternals(occupant);
+      if (mapped === "working") occupant.acq = false;
       this._agents.set(pane, occupant);
     }
 

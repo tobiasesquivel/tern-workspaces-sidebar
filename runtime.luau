@@ -354,11 +354,15 @@ function runtime.publish(
 		focused_tab = d_tab[focused_d] or focused_tab
 	end
 	local now = now_ms()
+	-- The rail's sound switch: the daemon plays the chimes and mutes on `false`.
+	local ok_kv, sound_kv = pcall(tern.kv.get, "sound_enabled")
+	local sound_on = not (ok_kv and sound_kv == false)
 	local ok_key, key = pcall(tern.json.encode, {
 		agents = agents_out,
 		panes = enriched,
 		focused_pane = focused_pane,
 		focused_tab = focused_tab,
+		sound = sound_on,
 	})
 	if ok_key and key == last_obs_key and (now - last_obs_ms) < OBS_HEARTBEAT_MS then
 		return false
@@ -373,6 +377,7 @@ function runtime.publish(
 		focused_tab = focused_tab,
 		agents = agents_out,
 		panes = enriched,
+		sound = sound_on,
 		chime = last_chime,
 	}
 	local ok_enc, text = pcall(tern.json.encode, obs)
@@ -393,13 +398,12 @@ function runtime.publish(
 	return true
 end
 
---- Hands one chime to the daemon, which starts the player outside the window (a spawn
---- from a hook can pass its 50 ms budget on its own). Rewrites this VM's observation at
---- once with the chime in it — a file write, never a spawn. The daemon plays a chime seq
---- once, and only while it is fresh next to the observation's own clock (`at` against
---- `observed_at`), so a heartbeat that still carries it, or a daemon that starts later,
---- never replays it. False — the caller plays it itself — when there is no live daemon
---- to take it: nothing published yet, or a snapshot that stopped advancing.
+--- Hands one chime to the daemon. Rewrites this VM's observation at once with the chime
+--- in it — a file write, never a spawn. A live daemon does not play it: its own notifier
+--- (`runtime/notify.mjs`) already chimes every transition it arbitrates, with herdr's 1 s
+--- delay, so the handoff only keeps the rail from starting a player of its own. False —
+--- the caller plays it itself — when there is no live daemon to take it: nothing
+--- published yet, or a snapshot that stopped advancing.
 function runtime.chime(kind: string): boolean
 	local obs = last_obs
 	if obs == nil or not snap_ok or runtime.is_stale() then
