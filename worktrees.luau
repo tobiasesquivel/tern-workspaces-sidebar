@@ -5,8 +5,9 @@
 --
 -- Discipline (50 ms per handler): process callbacks never draw. They update these
 -- caches and bump a generation counter, and the sidebar's poll redraws when the
--- generation changes. Reads are single-flight per key and concurrent waiters share
--- one git run, so a 250 ms poll can never stack up processes.
+-- generation changes. The checkout of a cwd is read from git's own files, as herdr
+-- does, never by running git; the reads that do run git (list, dirty, create, remove)
+-- are single-flight per key, so a 250 ms poll can never stack up processes.
 
 local git = require("./git")
 
@@ -49,7 +50,6 @@ export type Head = {
 }
 
 local cwd_cache: { [string]: { at: number, value: Info? } } = {}
-local cwd_inflight: { [string]: boolean } = {}
 local list_cache: { [string]: { at: number, value: { git.Worktree } } } = {}
 local list_waiters: { [string]: { ((list: { git.Worktree }?, cx: WindowCx?) -> ()) } } = {}
 local dirty_cache: { [string]: { at: number, value: number } } = {}
@@ -86,9 +86,11 @@ function worktrees.invalidate()
 	generation += 1
 end
 
+--- `GIT_OPTIONAL_LOCKS=0`: a `git status` must not refresh `.git/index`. Tern watches a linked
+--- plugin's tree, so that write in this repo reloads the plugin that caused it.
 local function run(argv: { string }, cwd: string, cb: (result: tern.ProcessResult, cx: WindowCx?) -> ())
 	local ok = pcall(function()
-		tern.process.run(argv, { cwd = cwd, env = { ["LC_ALL"] = "C" }, timeout_ms = TIMEOUT_MS }, cb)
+		tern.process.run(argv, { cwd = cwd, env = { ["LC_ALL"] = "C", ["GIT_OPTIONAL_LOCKS"] = "0" }, timeout_ms = TIMEOUT_MS }, cb)
 	end)
 	if not ok then
 		cb({ status = -1, stdout = "", stderr = "could not run git", timed_out = false }, nil)
@@ -126,71 +128,117 @@ function worktrees.info_peek(cwd: string): Info?
 	return if entry then entry.value else nil
 end
 
---- Whether `info_for` would start a read for this cwd: no fresh answer and none in
---- flight. The poll asks this to pick the single read it does per tick.
+--- Whether `info_for` would read this cwd again: no fresh answer. The poll asks this to
+--- pick the single read it does per tick.
 function worktrees.info_stale(cwd: string): boolean
 	if cwd == "" then
 		return false
 	end
-	local key = key_of(cwd)
-	return not is_fresh(cwd_cache[key]) and not cwd_inflight[key]
+	return not is_fresh(cwd_cache[key_of(cwd)])
 end
 
---- Cached worktree info for a cwd, read without waiting: the sidebar needs this
---- inside a draw. A stale or missing answer kicks a background refresh and the
---- value comes back on a later poll. nil means "not inside a git checkout" (also
---- cached, so a non-repo cwd costs nothing after the first look).
+--- The checkout holding `start`, found the way herdr finds it (`git_repo_root` and
+--- `git_dir_for_repo_root`, `src/workspace/git/discovery.rs`): walk up from `start` to
+--- the first directory whose `.git` is a git dir — a `.git` directory, or a `.git` file
+--- naming one — that holds a `HEAD`. An invalid marker does not count and the walk goes
+--- on. Returns the checkout root and its git dir, or nil outside any checkout.
+local function discover(start: string): (string?, string?)
+	local dir = git.normalize(start)
+	while dir ~= "" do
+		local marker = dir .. "/.git"
+		if string.sub(dir, -1) == "/" then
+			marker = dir .. ".git"
+		end
+		if tern.fs.exists(marker) then
+			-- A directory raises on a bounded read (regular files only), so a read that
+			-- answers is the `.git` file of a linked checkout or a submodule.
+			local ok, text = pcall(tern.fs.read, marker, 4096)
+			local git_dir: string? = nil
+			if ok and type(text) == "string" then
+				local pointed = git.parse_gitdir_file(text)
+				if pointed then
+					git_dir = git.resolve(dir, pointed)
+				end
+			elseif not ok then
+				git_dir = git.normalize(marker)
+			end
+			if git_dir and tern.fs.exists(git_dir .. "/HEAD") then
+				return dir, git_dir
+			end
+		end
+		local up = git.parent(dir)
+		if up == dir or up == "" then
+			break
+		end
+		dir = up
+	end
+	return nil, nil
+end
+
+--- A small file's text, or nil when it is missing or unreadable.
+local function read_small(path: string): string?
+	local ok, text = pcall(tern.fs.read, path, 4096)
+	return if ok and type(text) == "string" then text else nil
+end
+
+--- The worktree info of a cwd from the files git keeps, the way herdr reads it
+--- (`git_worktree_info`): the common dir is `<git dir>/commondir` resolved, or the git
+--- dir itself; the branch is what `<git dir>/HEAD` names, nil when detached. nil
+--- outside any checkout.
+local function read_info(cwd: string): Info?
+	local root, git_dir = discover(cwd)
+	if root == nil or git_dir == nil then
+		return nil
+	end
+	local common_text = read_small(git_dir .. "/commondir")
+	local pointed = if common_text then string.match(common_text, "^[^%c]*") else nil
+	local common_dir = if pointed and pointed ~= "" then git.resolve(git_dir, pointed) else git_dir
+	local head = read_small(git_dir .. "/HEAD")
+	return {
+		cwd = git.normalize(cwd),
+		root = git.normalize(root),
+		common_dir = common_dir,
+		repo_key = git.repo_key(common_dir),
+		repo_name = git.repo_name(common_dir),
+		main_checkout = git.main_checkout(common_dir),
+		linked = git.is_linked(root, common_dir),
+		branch = if head then git.parse_head(head) else nil,
+	}
+end
+
+--- Cached worktree info for a cwd. A stale or missing answer is read again on the spot
+--- from git's own files — no process: a spawn from a window hook costs 2 to 70 ms on
+--- Windows, and one past 50 ms disables every timer of the plugin. nil means "not
+--- inside a git checkout" (also cached, so a non-repo cwd costs nothing while fresh).
 ---
---- This is the version that starts a process: call it from the poll or from a user
---- action, never from a draw — one `git rev-parse` can cost more than a whole
---- window call budget on a cold cache.
+--- This is the version that reads the disk: call it from the read tick or from a user
+--- action, never from a draw, which uses `info_peek`.
 function worktrees.info_for(cwd: string): Info?
 	if cwd == "" then
 		return nil
 	end
 	local key = key_of(cwd)
 	local entry = cwd_cache[key]
-	if is_fresh(entry) or cwd_inflight[key] then
+	if is_fresh(entry) then
 		return entry and entry.value or nil
 	end
 
-	cwd_inflight[key] = true
-	run({
-		"git", "-C", cwd, "rev-parse", "--path-format=absolute",
-		"--show-toplevel", "--git-common-dir", "--abbrev-ref", "HEAD",
-	}, cwd, function(res)
-		cwd_inflight[key] = nil
-		local parsed = if res.status == 0 then git.parse_rev_parse(res.stdout) else nil
-		local value: Info? = nil
-		if parsed then
-			value = {
-				cwd = git.normalize(cwd),
-				root = parsed.toplevel,
-				common_dir = parsed.common_dir,
-				repo_key = git.repo_key(parsed.common_dir),
-				repo_name = git.repo_name(parsed.common_dir),
-				main_checkout = git.main_checkout(parsed.common_dir),
-				linked = git.is_linked(parsed.toplevel, parsed.common_dir),
-				branch = parsed.branch,
-			}
+	local ok, value = pcall(read_info, cwd)
+	local info: Info? = if ok then value else nil
+	if not same_info(entry and entry.value or nil, info) then
+		generation += 1
+	end
+	-- One entry per cwd a session ever reported (every `cd` adds one), so drop the
+	-- ones nobody has asked about for a long time. Not the merely stale ones: a stale
+	-- answer is still what the rail draws until its own read lands, and dropping it
+	-- would blank another session's branch cell for a tick.
+	for k, old in cwd_cache do
+		if now() - old.at > KEEP_MS then
+			cwd_cache[k] = nil
 		end
-		local previous = cwd_cache[key]
-		if not same_info(previous and previous.value or nil, value) then
-			generation += 1
-		end
-		-- One entry per cwd a session ever reported (every `cd` adds one), so drop the
-		-- ones nobody has asked about for a long time. Not the merely stale ones: a stale
-		-- answer is still what the rail draws until its own read lands, and dropping it
-		-- would blank another session's branch cell for a tick.
-		for k, entry in cwd_cache do
-			if now() - entry.at > KEEP_MS then
-				cwd_cache[k] = nil
-			end
-		end
-		cwd_cache[key] = { at = now(), value = value }
-	end)
-
-	return entry and entry.value or nil
+	end
+	cwd_cache[key] = { at = now(), value = info }
+	return info
 end
 
 local function same_list(a: { git.Worktree }, b: { git.Worktree }): boolean

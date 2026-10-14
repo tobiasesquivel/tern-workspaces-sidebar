@@ -27,9 +27,11 @@ export type Kind = "done" | "request"
 export type Chime = { pane: number, kind: Kind }
 
 --- One agent that moved between two polls, as the model hands it over (`AgentMove`): its
---- pane, the state it was in (nil on a first sighting), the state it is in now, and whether
---- its pane sits in the tab you are on — herdr's suppress-active rule needs that last fact.
-export type Move = { pane: number, prev: string?, next: string, active: boolean }
+--- pane, the state it was in (nil on a first sighting), the state it is in now, whether
+--- its pane sits in the tab you are on — herdr's suppress-active rule needs that fact —
+--- and whether the daemon flagged this move an explicit completion (`done` rides an
+--- `idle` arrival the poll never saw as a native transition).
+export type Move = { pane: number, prev: string?, next: string, active: boolean, done: boolean? }
 
 --- The bound herdr puts on a player (15 s): long enough for either mp3, short enough that a
 --- wedged player cannot pile up behind the next one.
@@ -40,6 +42,19 @@ local sound = {}
 --- The chimes nothing has played yet. `observe` appends, the read tick drains. No state
 --- history lives here: the per-pane state is the model's single observation.
 local queued: { Chime } = {}
+
+--- Who plays a chime instead of this VM, when someone can: the runtime daemon. A spawn
+--- from a window hook is synchronous and spikes past the 50 ms budget at random
+--- (measured: 30 to 77 ms for any program on a loaded Windows machine), and one past it
+--- disables every timer of the plugin — the rail froze on the very tick that played the
+--- question. The daemon is a long-lived process outside the window: the rail hands it the
+--- chime and the daemon starts the same player. nil, or a handoff that answers false (no
+--- live daemon), and this VM starts the player itself, as before.
+local handoff: ((kind: Kind) -> boolean)? = nil
+
+function sound.set_handoff(fn: ((kind: Kind) -> boolean)?)
+	handoff = fn
+end
 
 --- Absolute path of the audio file for a kind, inside the plugin folder.
 ---
@@ -69,18 +84,30 @@ local function player_argv(file: string): { string }?
 end
 
 --- herdr's `notification_sound_for_state_change` as a pure function: the chime a pane's
---- agent transition deserves, or nil.
+--- agent transition deserves, or nil. `done` marks the move a completion of the
+--- daemon's `done` status: an `idle` arrival with it chimes `done` even when the
+--- poll never saw the `working` before it (the snapshot folded a turn the native
+--- list skipped). `unknown` is never a busy state and chimes nothing.
 ---
 --- `prev == nil` is a first sighting — the rail has just started and nothing was observed to
 --- move — and never chimes. `active` says the pane sits in the focused tab, which is herdr's
 --- `suppress_active_tab_notifications`.
-function sound.kind_for(prev: string?, next: string, active: boolean): Kind?
+function sound.kind_for(prev: string?, next: string, active: boolean, done: boolean?): Kind?
+	-- The completion edge first: the model emits `done` exactly once per completion,
+	-- even when the `idle` arrival matches what the pane already showed. A first
+	-- sighting stays silent (a reload hears nothing).
+	if next == "idle" and done == true and prev ~= nil and not active then
+		return "done"
+	end
 	if prev == nil or next == prev then
 		return nil
 	end
 	if next == "waiting_input" then
 		-- A question is worth hearing wherever you are: herdr does not gate this one.
 		return "request"
+	end
+	if next == "unknown" then
+		return nil
 	end
 	if next == "idle" and (prev == "working" or prev == "waiting_input") and not active then
 		return "done"
@@ -98,7 +125,7 @@ end
 function sound.observe(moves: { Move }): { Chime }
 	local out: { Chime } = {}
 	for _, move in moves do
-		local kind = sound.kind_for(move.prev, move.next, move.active)
+		local kind = sound.kind_for(move.prev, move.next, move.active, move.done)
 		if kind ~= nil then
 			local chime = { pane = move.pane, kind = kind }
 			table.insert(out, chime)
@@ -108,8 +135,9 @@ function sound.observe(moves: { Move }): { Chime }
 	return out
 end
 
---- Plays at most one queued chime and drops the rest. The read tick's one I/O call: the
---- only place in the plugin where a sound may start a process.
+--- Plays at most one queued chime and drops the rest: hands it to the daemon when one
+--- takes it, else starts the player — the only place in the plugin where a sound may
+--- start a process.
 ---
 --- Returns true only when it really started the player, so the caller can spend the hook's
 --- budget on it: the read tick takes the player as its one spawn and leaves the git read for
@@ -135,6 +163,13 @@ function sound.flush(): boolean
 		if c.kind == "request" then
 			chime = c
 			break
+		end
+	end
+	-- Handed off: the daemon plays it and this hook spawned nothing, so nothing is spent.
+	if handoff ~= nil then
+		local ok_hand, handed = pcall(handoff, chime.kind)
+		if ok_hand and handed == true then
+			return false
 		end
 	end
 	local file = sound.path(chime.kind)

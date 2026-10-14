@@ -183,6 +183,56 @@ function git.is_linked(toplevel: string, common_dir: string): boolean
 	return not git.equal_path(toplevel, git.main_checkout(common_dir))
 end
 
+--- Whether a path is absolute: a drive (`C:/...`), a UNC or a POSIX root.
+function git.is_absolute(p: string): boolean
+	local s = git.normalize(p)
+	return string.match(s, "^%a:/") ~= nil or string.sub(s, 1, 1) == "/"
+end
+
+--- `rel` resolved against `base` (unless it is absolute) with `.` and `..` folded, the
+--- way git resolves the paths in a `.git` file and in `commondir`.
+function git.resolve(base: string, rel: string): string
+	local joined = if git.is_absolute(rel) then git.normalize(rel) else git.normalize(base) .. "/" .. git.normalize(rel)
+	local prefix = string.match(joined, "^%a:/") or (if string.sub(joined, 1, 2) == "//" then "//" elseif string.sub(joined, 1, 1) == "/" then "/" else "")
+	local parts: { string } = {}
+	for part in string.gmatch(string.sub(joined, #prefix + 1), "[^/]+") do
+		if part == ".." then
+			if #parts > 0 then
+				table.remove(parts)
+			end
+		elseif part ~= "." then
+			table.insert(parts, part)
+		end
+	end
+	return git.normalize(prefix .. table.concat(parts, "/"))
+end
+
+-- Discovery files -----------------------------------------------------------
+-- herdr finds a checkout by reading files, not by running git
+-- (`src/workspace/git/discovery.rs`): a `.git` directory, or a `.git` file naming the
+-- git dir; `<git dir>/commondir` naming the shared dir; `<git dir>/HEAD` naming the
+-- branch. These parse the contents; worktrees.luau does the reads.
+
+--- The git dir a `.git` file points at (`gitdir: <path>`), or nil when the text is not
+--- one: herdr does not count an invalid marker as a checkout.
+function git.parse_gitdir_file(text: string): string?
+	local path = string.match(string.match(text, "^[^%c]*") or "", "^gitdir:%s*(.-)%s*$")
+	if path == nil or path == "" then
+		return nil
+	end
+	return path
+end
+
+--- The branch a `HEAD` file names (`ref: refs/heads/<name>`), or nil for a detached
+--- HEAD (an object id) — herdr's `git_branch`, which `--abbrev-ref` matched before.
+function git.parse_head(text: string): string?
+	local name = string.match(string.match(text, "^[^%c]*") or "", "^ref:%s*refs/heads/(.-)%s*$")
+	if name == nil or name == "" then
+		return nil
+	end
+	return name
+end
+
 -- Parsing -------------------------------------------------------------------
 
 --- Parse the three lines of

@@ -9,3 +9,6 @@ harness.lua
 
 # Layout dumps from Tern.
 *.layout.json
+
+# Captures from the agent-runtime lab.
+target/
