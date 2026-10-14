@@ -94,7 +94,12 @@ function model.tab_of(cx: WindowCx, pane: number): number?
 	return nil
 end
 
--- Per-cycle cache; window.luau invalidates at each cycle start / mutation
+-- Per-hook cache of the rails; window.luau invalidates it at the start of every hook and
+-- after every open or close. It once never turned valid: each `is_mine` re-read the
+-- canvas list and asked `pane()` of every rail, once per leaf of every tab. With 25 tabs
+-- the paint tick spent ~30 ms before its mount ahead (`premount`), which then never ran
+-- (it waits for a hook with budget left): tabs stayed without a rail, and a click on one
+-- of their rows showed the tab with no sidebar (measured in the lab, 2026-10-14).
 local cache_panes: { number } = {}
 local cache_valid = false
 
@@ -115,6 +120,7 @@ function model.mine(cx: WindowCx): { number }
 		end
 	end
 	cache_panes = out
+	cache_valid = true
 	return out
 end
 
@@ -158,30 +164,108 @@ function model.tab_has_sidebar(cx: WindowCx, tab_id: number): (boolean, number?)
 	return false, nil
 end
 
--- Closes accidental duplicate sidebar panes in the same tab
+--- Every rail of this plugin the window's canvas list holds, including the ones `mine`
+--- leaves out because `pane()` does not answer for them (a pane another client created).
+--- Only for turning the rail off: those are rails too, and Hide has to take them away.
+function model.all_rails(cx: WindowCx): { number }
+	local out = {}
+	for _, c in cx.canvas:list() do
+		if c.owner == tern.plugin.id and c.title == TITLE then
+			table.insert(out, c.pane)
+		end
+	end
+	return out
+end
+
+--- The leftmost leaf of a tab tree: where the rail sits when it is placed.
+local function first_leaf(tree: any): number?
+	while tree ~= nil do
+		if tree.pane ~= nil then
+			return tree.pane
+		end
+		tree = tree[1]
+	end
+	return nil
+end
+
+--- Tabs a click is moving to, until when: no cleanup touches them meanwhile (the switch
+--- and the mount that may come with it are not done yet).
+local protected_until: { [number]: number } = {}
+
+--- Keep `tab_id` out of every cleanup (dedup, auto-close) for `ms`.
+function model.protect_tab(tab_id: number, ms: number)
+	protected_until[tab_id] = tern.now() + ms
+end
+
+local function protected(tab_id: number): boolean
+	local until_t = protected_until[tab_id]
+	if until_t == nil then
+		return false
+	end
+	if tern.now() >= until_t then
+		protected_until[tab_id] = nil
+		return false
+	end
+	return true
+end
+
+--- Closes a second rail in a tab. The one kept is the one on screen at the tab's left
+--- (the first leaf of its tree), never the order of the canvas list: a duplicate that
+--- happens to be listed first must not take away the rail the user is looking at. A tab
+--- the layout API does not describe, or one a click is moving to, is left alone.
 function model.deduplicate_sidebars(cx: WindowCx)
-	local seen_tab: { [number]: number } = {}
+	local by_tab: { [number]: { number } } = {}
 	for _, pane in model.mine(cx) do
 		local tab = model.tab_of(cx, pane)
 		if tab then
-			if seen_tab[tab] then
-				cx.layout:close(pane)
-				model.invalidate()
-			else
-				seen_tab[tab] = pane
+			local list = by_tab[tab]
+			if list == nil then
+				list = {}
+				by_tab[tab] = list
+			end
+			table.insert(list, pane)
+		end
+	end
+	for tab, list in by_tab do
+		if #list > 1 and not protected(tab) then
+			local l = cx.session:layout(tab)
+			if l and l.root then
+				local keep = list[1]
+				local left = first_leaf(l.root)
+				for _, p in list do
+					if p == left then
+						keep = p
+					end
+				end
+				for _, p in list do
+					if p ~= keep then
+						cx.layout:close(p)
+						model.invalidate()
+					end
+				end
 			end
 		end
 	end
 end
 
+--- When each tab was first seen holding nothing but rails, by tab.
+local rail_only_since: { [number]: number } = {}
+--- How long a tab must stay rail-only before its rail is closed.
+model.AUTO_CLOSE_MS = 400
+
 -- Ctrl+D support: a tab holding ONLY the sidebar gets it closed, so Tern closes the tab.
--- Toggleable via kv "auto_close_empty_tabs" (default ON).
+-- Toggleable via kv "auto_close_empty_tabs" (default ON). The tab has to look that way in
+-- two looks at least AUTO_CLOSE_MS apart, so a moment in the middle of a move or a switch
+-- never closes a rail; a tab a click is moving to, and a tab whose other panes float, are
+-- never touched.
 function model.auto_close_empty_tabs(cx: WindowCx)
 	local enabled = tern.kv.get("auto_close_empty_tabs")
 	if enabled == false then
 		return
 	end
 
+	local now = tern.now()
+	local seen: { [number]: boolean } = {}
 	for _, tab in cx.session:tabs() do
 		local l = cx.session:layout(tab.id)
 		if l and l.root then
@@ -205,11 +289,24 @@ function model.auto_close_empty_tabs(cx: WindowCx)
 			end
 
 			count_leaves(l.root)
+			local floats = l.floats ~= nil and #l.floats > 0
 
-			if total > 0 and total == sidebar_count and sidebar_pane then
-				cx.layout:close(sidebar_pane)
-				model.invalidate()
+			if total > 0 and total == sidebar_count and sidebar_pane and not floats and not protected(tab.id) then
+				seen[tab.id] = true
+				local since = rail_only_since[tab.id]
+				if since == nil then
+					rail_only_since[tab.id] = now
+				elseif now - since >= model.AUTO_CLOSE_MS then
+					rail_only_since[tab.id] = nil
+					cx.layout:close(sidebar_pane)
+					model.invalidate()
+				end
 			end
+		end
+	end
+	for id in rail_only_since do
+		if not seen[id] then
+			rail_only_since[id] = nil
 		end
 	end
 end
@@ -583,6 +680,30 @@ end
 -- all read this, so they agree on what is hidden.
 function model.collapsed_map(cx: WindowCx): { [number]: boolean }
 	return model.fold_rows(model.rail_rows(cx), cx.sessions:current().id)
+end
+
+--- The group the current session hangs under opens for good: its explicit fold is
+--- cleared. `group.folded` already shows it open while the session is current, but only
+--- in the rails drawn from that session; the others drew it folded, so one row sat at a
+--- different height in each rail. A click that switched tabs moved the pointer onto
+--- another row of the rail it landed on, and a second click there hit the `Hide` badge:
+--- every rail closed (reproduced in the lab, 2026-10-14). Writing the reveal down makes
+--- every rail draw the same rows. True when it wrote.
+function model.reveal_current(rows: { group.Row }, current: number?): boolean
+	if current == nil then
+		return false
+	end
+	for _, r in rows do
+		if r.id == current then
+			local parent = r.parent
+			if parent ~= nil and tern.kv.get("fold_" .. parent) == true then
+				tern.kv.set("fold_" .. parent, false)
+				return true
+			end
+			return false
+		end
+	end
+	return false
 end
 
 --- The fold map for rows the caller already built.

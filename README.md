@@ -37,7 +37,9 @@ rename it, close the group, and the worktree actions.
 
 To hide or show the sidebar, use the `Hide` badge at its bottom, the key `Ctrl+Alt+B`, or the
 `Workspaces: toggle sidebar` command in the palette. For another key, add it to `keybinds` in
-`%APPDATA%\Tern\settings.json`.
+`%APPDATA%\Tern\settings.json`. The `Hide` and `+ Workspace` badges ignore a click that comes
+less than a second after a click that switched tabs or folded a row: that is the second click
+of a double click, landing where the rows moved.
 
 ## Badges
 
@@ -154,6 +156,13 @@ does, so it runs no git process while you work; only the worktree actions do.
   `tern plugin reload`. The sidebar keeps its periodic hooks free of process starts except for
   rare ones (starting the runtime, and playing a sound while no runtime is up), and on a
   heavily loaded machine one of those can still run long.
+- Tern focuses a pane on the press, before the plugin hears the click, and a canvas has no
+  option to stay out of the focus (`canvas:open` takes only `title`, `about`, `view`, `md`,
+  `dock`, `how` and `focus`, and `focus` only applies to the open). The sidebar hands the
+  keyboard back to the tab's terminal in the same event, before the next frame, and titles
+  the tab after its terminal meanwhile. What stays visible is Tern's focus line moving to the
+  sidebar and back on each press. A key typed in the same frame as a click that switches tabs
+  (under 8 ms) reaches the terminal of the tab the click came from.
 - Only omp, Claude Code and Codex report states. Codex runs with its hooks passed as `-c`
   overrides, which makes it skip its shared background server for that session.
 - Tern tells the runtime when a pane's title changes but not when its output does, so a

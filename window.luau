@@ -81,6 +81,63 @@ local PAINT_SLICE_MS = 20
 --- When the running hook started: the slice and the mount ahead are measured from it, so
 --- one hook's mount, sync and repaint share its 50 ms instead of each taking a slice.
 local hook_started = 0
+
+--- The title each tab shows by its terminal, by tab id, for the moment the rail holds the
+--- focus (see the `tab_title` formatter below).
+local tab_labels: { [number]: string } = {}
+--- The rail panes, by pane: a tab whose focused block is one of these is pressed on.
+local rail_panes: { [number]: boolean } = {}
+
+local SHELLS: { [string]: boolean } = {
+	pwsh = true, powershell = true, cmd = true, bash = true, zsh = true, fish = true, sh = true, nu = true,
+}
+
+--- The last path segment, either slash.
+local function base_name(path: string): string
+	local trimmed = string.gsub(path, "[/\\]+$", "")
+	return string.match(trimmed, "([^/\\]+)$") or trimmed
+end
+
+--- How Tern titles a tab by its terminal: the name the user gave it, else the folder of a
+--- shell, else the program (measured: `w1` for a shell in `...\w1`, `cmd` for cmd.exe).
+local function label_of(t: TabInfo): string?
+	if t.name ~= nil and t.name ~= "" then
+		return t.name
+	end
+	local program = string.lower(base_name(t.program or ""))
+	program = string.gsub(program, "%.exe$", "")
+	if (program == "" or SHELLS[program]) and t.cwd ~= nil and t.cwd ~= "" then
+		return base_name(t.cwd)
+	end
+	if program ~= "" then
+		return program
+	end
+	return nil
+end
+
+--- Keep each tab's terminal title and the rail panes for the formatter. `snap.tabs` already
+--- describes a tab whose focused block is the rail by its terminal (`model.tabs_by_terminal`).
+local function remember_labels(snap: any, panes: { number })
+	local changed = false
+	for _, t in snap.tabs do
+		local label = label_of(t)
+		if label ~= nil and tab_labels[t.id] ~= label then
+			-- A first label needs no redraw: Tern asks the formatter when a press changes
+			-- the tab's focused block. A label that changed (a `cd`) drops a cached answer.
+			changed = changed or tab_labels[t.id] ~= nil
+			tab_labels[t.id] = label
+		end
+	end
+	local rails: { [number]: boolean } = {}
+	for _, p in panes do
+		rails[p] = true
+	end
+	rail_panes = rails
+	if changed then
+		pcall(tern.chrome.refresh)
+	end
+end
+
 local function refresh(cx: WindowCx)
 	local panes = mine(cx)
 	if #panes == 0 then
@@ -91,6 +148,10 @@ local function refresh(cx: WindowCx)
 		pcall(tern.log.warn, "ws snapshot failed: " .. tostring(snap))
 		return
 	end
+	-- The group the current session hangs under opens for every rail, not only for the
+	-- rails drawn from that session: all rails then hold the same rows at the same heights.
+	pcall(model.reveal_current, snap.rows, snap.current)
+	remember_labels(snap, panes)
 	local order: { { pane: number, tab: number? } } = {}
 	for _, pane in panes do
 		local tab = model.tab_of(cx, pane)
@@ -164,6 +225,15 @@ local function open(cx: WindowCx, tab_id: number, focus: boolean)
 			local moved = cx.layout:move(pane, target, "left", { focus = false })
 			if not moved and active_tab ~= tab_id then
 				cx.layout:move_to_tab(pane, tab_id, { focus = false })
+			end
+			model.invalidate()
+			if model.tab_of(cx, pane) ~= tab_id then
+				-- The window refused both moves: the new rail sits beside the focused pane of
+				-- the tab on screen. Moving that tab's terminal next to it would carry a
+				-- terminal into another tab; close the stray rail and let a later tick retry.
+				cx.layout:close(pane)
+				model.invalidate()
+				return
 			end
 			if active_tab ~= tab_id then
 				-- The pane moved into a tab becomes that tab's focused block, so the rail
@@ -523,7 +593,9 @@ end
 --- getting one — or back on: pin it and mount it on the tab the window is on. One
 --- implementation behind the command, the status segment and the rail's own Hide badge.
 local function toggle_sidebar(cx: WindowCx)
-	local panes = mine(cx)
+	-- Every rail in the canvas list, also one `mine` leaves out because the window's
+	-- `pane()` does not describe it: Hide has to take that one away too.
+	local panes = model.all_rails(cx)
 	if tern.kv.get("pinned") or #panes > 0 then
 		tern.kv.set("pinned", nil)
 		for _, p in panes do
@@ -752,6 +824,17 @@ tern.chrome.status(function(_pane: StatusPaneInfo): { StatusSegment }?
 	return { seg }
 end)
 
+--- While a press keeps the rail focused, Tern titles the tab after its focused block: the
+--- rail, `Workspaces` (measured: one frame per press, before the focus handler hands the
+--- keyboard back). That tab is titled after its terminal instead, the way Tern titles it
+--- otherwise; every other tab keeps Tern's own title (nil).
+tern.chrome.tab_title(function(tab: TabInfo): string?
+	if rail_panes[tab.pane] or tab.title == TITLE then
+		return tab_labels[tab.id]
+	end
+	return nil
+end)
+
 -- El click derecho no existe en las vistas de un plugin: el menú de una fila es un
 -- picker nativo de Tern, abierto por el botón "⋯" o con doble click en la fila.
 local canvas_action: any = nil
@@ -763,7 +846,8 @@ local function run_menu(cx: WindowCx, items: { PickItem }, placeholder: string, 
 				owner = tern.plugin.id,
 				pane = 0,
 				act = item.act,
-				node = "",
+				-- A picked item is a decision, never a stray click (see STRAY_MS).
+				node = "menu",
 				text = item.label,
 				title = TITLE,
 				about = nil,
@@ -852,6 +936,13 @@ local function refocus_terminal(ev: any, cx: WindowCx)
 	end
 end
 
+--- When the last click on a row that moves rows (a tab switch, a fold) landed.
+local last_row_click = -1e9
+--- How long after such a click a footer badge does not answer.
+local STRAY_MS = 1000
+--- How long the tab a click moves to is kept out of dedup and auto-close.
+local PROTECT_MS = 1500
+
 canvas_action = function(ev: CanvasAction, cx: WindowCx): boolean?
 	if ev.owner ~= tern.plugin.id then
 		return nil
@@ -873,6 +964,16 @@ canvas_action = function(ev: CanvasAction, cx: WindowCx): boolean?
 		tern.kv.set("moving_tab", nil)
 		painted = {}
 		refresh(cx)
+		return true
+	end
+
+	-- The footer badges sit right under the last row, so a row that moves puts them under a
+	-- pointer that did not move. A click on one of them that comes right after a click
+	-- that switched tabs or folded a row is the second click of the user's gesture landing
+	-- on the destination rail, not a decision: measured in the lab, a second click on a tab
+	-- row hit `Hide` there and every rail closed.
+	if (kind == "hide" or kind == "new") and ev.node ~= "menu" and tern.now() - last_row_click < STRAY_MS then
+		pcall(tern.log.warn, "ws ignored " .. kind .. ": " .. tostring(math.floor(tern.now() - last_row_click)) .. " ms after a row click")
 		return true
 	end
 
@@ -1011,6 +1112,7 @@ canvas_action = function(ev: CanvasAction, cx: WindowCx): boolean?
 	elseif kind == "fold" and n then
 		-- The map already layers the stored key over the default, so the toggle negates it.
 		tern.kv.set("fold_" .. n, not (model.collapsed_map(cx)[n] == true))
+		last_row_click = tern.now()
 	elseif kind == "toggle_lock" and n then
 		-- Interactive lock toggle
 		for _, s in cx.sessions:list() do
@@ -1129,6 +1231,15 @@ canvas_action = function(ev: CanvasAction, cx: WindowCx): boolean?
 		end
 
 		if target_tab then
+			last_row_click = tern.now()
+			-- No cleanup touches the tab this click moves to until the switch has settled.
+			model.protect_tab(n, PROTECT_MS)
+			-- A tab without its rail yet gets it now, before the switch: the user clicked a
+			-- row in a rail and must land on a tab that has one (measured: a tab the mount
+			-- ahead had not reached showed with no sidebar, read as "the sidebar closed").
+			if tern.kv.get("pinned") and cx.session:layout(n) ~= nil and not (model.tab_has_sidebar(cx, n)) then
+				pcall(open, cx, n, false)
+			end
 			local cur_s = cx.sessions:current().id
 			if target_tab.session ~= cur_s then
 				cx.sessions:switch(target_tab.session)
@@ -1254,7 +1365,7 @@ local function paint_tick(cx: WindowCx?)
 	end
 	hook_started = tern.now()
 	model.invalidate()
-	pcall(model.auto_close_empty_tabs, cx)
+	-- ensure_pinned runs the cleanups (dedup, auto-close) too: once per hook is enough.
 	pcall(ensure_pinned, cx)
 	-- One rail mounted ahead in a tab that has none, so no visit finds it missing.
 	pcall(premount, cx)
