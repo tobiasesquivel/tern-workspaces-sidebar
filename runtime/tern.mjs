@@ -3,7 +3,7 @@
 // calls new/split/move/rename/focus/close. Pane ids are full doubles;
 // never truncate with bitwise ops (|0, >>>) since lab ids exceed 2^32.
 
-import { execFile as execFileCb } from 'node:child_process';
+import { execFile as execFileCb, spawn } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 export class TernError extends Error {
@@ -149,6 +149,14 @@ export function createTern({ binary, env = process.env, window, timeout } = {}) 
 
     async process(pane) {
       return runJson('process', [String(pane)]);
+    },
+
+    // `tern events [--filter KIND,...]`: JSON lines until killed. One long-lived
+    // child for the daemon (never a window hook); returns the ChildProcess.
+    events(kinds = []) {
+      const args = ['events', ...win];
+      if (kinds.length > 0) args.push('--filter', kinds.join(','));
+      return spawn(bin, args, { env, windowsHide: true, stdio: ['ignore', 'pipe', 'ignore'] });
     },
 
     // opts: { scrollback?, surfaces?, ansi?, html? } -> parsed object (has .text).

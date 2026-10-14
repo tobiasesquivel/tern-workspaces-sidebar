@@ -1,0 +1,23 @@
+# Tern overlay for herdr's claude.toml: rules appended after herdr's, with the same
+# engine (runtime/connectors/manifest.mjs). Each one is backed by a lab capture.
+id = "tern-claude"
+version = "2026.10.14.1"
+
+# Claude Code 2.1.296 on Windows draws its prompt box as `>` plus a no-break space
+# (U+00A0), never `❯` (lab capture, Tern pane). herdr's live_prompt_box misses it, and
+# the screen would still fall back to idle, but without `visible_idle`: every turn end
+# would wait out the plain-idle hold. Same region and exclusions as live_prompt_box.
+[[rules]]
+id = "live_prompt_box_windows"
+state = "idle"
+priority = 950
+region = "prompt_box_body"
+visible_idle = true
+line_regex = ['^\s*>\x{00A0}']
+not = [
+  { contains = ["enter to select"] },
+  { contains = ["esc to cancel"] },
+  { contains = ["tab/arrow keys"] },
+  { contains = ["arrow keys to navigate"] },
+  { contains = ["↑/↓ to navigate"] },
+]

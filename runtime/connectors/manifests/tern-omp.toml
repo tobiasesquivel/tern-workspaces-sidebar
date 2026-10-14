@@ -1,0 +1,16 @@
+# Tern rules for omp. herdr has no omp manifest: omp reports its whole lifecycle
+# through its extension, and the screen is not read. Tern reads it only while
+# `start` waits, to catch what the extension does not report: a startup dialog.
+id = "tern-omp"
+version = "2026.10.14.1"
+
+# omp 18.10.4 with a fresh agent dir: "Setup / step 1 of 5 / Sign in to your
+# providers", footer "↑/↓ select · ⏎ confirm · ⎋ skip · Ctrl+C exit setup" (lab capture).
+[[rules]]
+id = "omp_setup_wizard"
+state = "blocked"
+priority = 950
+region = "whole_recent"
+visible_blocker = true
+contains = ["exit setup"]
+line_regex = ['(?i)^\s*step \d+ of \d+\s*$']

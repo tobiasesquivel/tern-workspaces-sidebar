@@ -70,15 +70,16 @@ describe("report seq + identity", () => {
     assert.equal(r.reason, "no-occupant");
     assert.throws(() => s.get(1), (e) => e.code === "agent_not_found");
   });
-  it("probe ready on the pre-claimed pane resolves pending without session_start", () => {
+  it("a Claude hook never sets the state or readiness: the screen does (herdr)", () => {
     const s = new RuntimeState();
     const c = s.claim({ pane_id: 1, agent: "claude", name: "probe" });
+    assert.equal(c.agent_status, "unknown");
     const r = s.report({ v: 1, pane_id: 1, launch_id: c.terminal_id, source: "tern:claude", agent: "claude", state: "idle", seq: 1, ready: true });
     assert.equal(r.accepted, true);
     const a = s.get(1);
-    assert.equal(a.agent_status, "idle");
-    assert.equal(a.launch_pending, false);
-    assert.equal(a.interactive_ready, true);
+    assert.equal(a.agent_status, "unknown");
+    assert.equal(a.launch_pending, true);
+    assert.equal(a.interactive_ready, false);
   });
   it("accepts increasing seq, rejects stale", () => {
     const s = new RuntimeState();
@@ -124,8 +125,8 @@ describe("report seq + identity", () => {
     // UserPromptSubmit/Stop after it was dropped as stale-session and a real turn
     // never left idle. Old-session reports are still told apart by their epoch.
     const s = new RuntimeState();
-    s.claim({ pane_id: 1, agent: "claude", launch_id: "L1" });
-    const C = (extra) => R(1, "L1", { source: "tern:claude", agent: "claude", ...extra });
+    s.claim({ pane_id: 1, agent: "codex", launch_id: "L1" });
+    const C = (extra) => R(1, "L1", { source: "tern:codex", agent: "codex", ...extra });
     s.report(C({ state: "unknown", seq: 1, session: { kind: "id", value: "a" }, session_epoch: 0, session_start: true }));
     const r = s.report(C({ state: "working", seq: 2, session_epoch: 0 }));
     assert.equal(r.accepted, true);
@@ -220,56 +221,177 @@ describe("done / seen / focus", () => {
     assert.equal(done.message, null);
   });
 });
-describe("startup readiness via native surface (start contract)", () => {
-  it("unknown+pending third-party occupant resolves to idle+ready on native idle surface", () => {
-    const s = new RuntimeState();
-    s.claim({ pane_id: 70, agent: "claude" });
-    // Hook SessionStart: unknown, not ready. Discovery then sees the real
-    // startup prompt (classifySurface live_prompt_box => idle surface).
-    s.report({ v: 1, pane_id: 70, launch_id: s.get(70).terminal_id, source: "tern:claude", agent: "claude", state: "unknown", seq: 1 });
-    assert.equal(s.get(70).launch_pending, true);
-    s.observe({ v: 1, generation: "w1", agents: [{ pane: 70, agent: "claude", state: "idle" }], panes: [] });
-    const a = s.get(70);
-    // Start contract: (idle|done) + interactive_ready, never unknown.
-    assert.equal(a.agent_status, "idle");
-    assert.equal(a.interactive_ready, true);
+// A screen read from the daemon's detection loop (runtime/detection.mjs).
+const S = (agent, state, extra = {}) => ({ agent, state, visible_blocker: false, visible_idle: false, rule: null, ...extra });
+
+describe("screen state (herdr: the screen decides Claude, Codex hooks win but for a visible blocker)", () => {
+  it("Claude: the screen moves the state; a hook only lends its message to a blocked screen", () => {
+    let now = 1000;
+    const s = new RuntimeState({ now: () => now });
+    const c = s.claim({ pane_id: 1, agent: "claude", launch_id: "L1" });
+    const C = (extra) => ({ v: 1, pane_id: 1, launch_id: c.terminal_id, source: "tern:claude", agent: "claude", ...extra });
+    s.detect(1, S("claude", "idle", { visible_idle: true, at: now }));
+    assert.equal(s.get(1).agent_status, "idle");
+    s.detect(1, S("claude", "working", { at: (now += 500) }));
+    assert.equal(s.get(1).agent_status, "working");
+    // PermissionRequest hint: no state of its own.
+    s.report(C({ state: "blocked", hint: true, message: "Bash: echo hi", seq: 1 }));
+    assert.equal(s.get(1).agent_status, "working");
+    s.detect(1, S("claude", "blocked", { visible_blocker: true, rule: "bash_permission_prompt", at: (now += 300) }));
+    assert.deepEqual([s.get(1).agent_status, s.get(1).message], ["blocked", "Bash: echo hi"]);
+    s.detect(1, S("claude", "working", { at: (now += 300) }));
+    assert.deepEqual([s.get(1).agent_status, s.get(1).message], ["working", null]);
+    // Without a hint the rule names the blocker.
+    s.detect(1, S("claude", "blocked", { visible_blocker: true, rule: "live_blocked_form", at: (now += 300) }));
+    assert.equal(s.get(1).message, "live_blocked_form");
   });
-  it("a pending occupant that never reported, facing a startup dialog, becomes blocked with motive", () => {
-    // Measured with codex 0.159.1: its folder-trust dialog comes before any hook, so
-    // the occupant is still the claim's own idle (no evidence) — and start ran out
-    // its whole timeout instead of answering agent_not_ready with the reason.
-    const s = new RuntimeState();
-    s.claim({ pane_id: 74, agent: "codex" });
-    s.observe({ v: 1, generation: "tern-discovery", agents: [{ pane: 74, agent: "codex", state: "blocked", message: "trust_directory" }], panes: [] });
-    const a = s.get(74);
-    assert.equal(a.agent_status, "blocked");
-    assert.equal(a.message, "trust_directory");
-    // The next startup dialog replaces the reason while no report has come in.
-    s.observe({ v: 1, generation: "tern-discovery", agents: [{ pane: 74, agent: "codex", state: "blocked", message: "hooks_review" }], panes: [] });
-    assert.equal(s.get(74).message, "hooks_review");
+
+  it("Codex: the hook state wins over the screen, except a visible blocker no older than the hook", () => {
+    let now = 1000;
+    const s = new RuntimeState({ now: () => now });
+    const c = s.claim({ pane_id: 2, agent: "codex", launch_id: "L2" });
+    const X = (extra) => ({ v: 1, pane_id: 2, launch_id: c.terminal_id, source: "tern:codex", agent: "codex", ...extra });
+    s.detect(2, S("codex", "idle", { visible_idle: true, at: now }));
+    s.report(X({ state: "working", seq: 1 }));
+    assert.equal(s.get(2).agent_status, "working");
+    // A plain idle screen does not override the hook's working (herdr test
+    // fallback_idle_does_not_override_hook_working).
+    s.detect(2, S("codex", "idle", { at: (now += 300) }));
+    assert.equal(s.get(2).agent_status, "working");
+    // A visible blocker read after the hook does.
+    s.detect(2, S("codex", "blocked", { visible_blocker: true, rule: "live_strong_blocker", at: (now += 300) }));
+    assert.equal(s.get(2).agent_status, "blocked");
+    // The blocker leaves the screen: the hook's state is back.
+    s.detect(2, S("codex", "working", { at: (now += 300) }));
+    assert.equal(s.get(2).agent_status, "working");
+    // A blocker read before the newest hook does not override it.
+    s.detect(2, S("codex", "blocked", { visible_blocker: true, rule: "x", at: now - 1 }));
+    now += 10;
+    s.report(X({ state: "idle", seq: 2 }));
+    assert.equal(s.get(2).agent_status, "done");
   });
-  it("unknown+pending occupant facing a classified dialog becomes blocked with motive", () => {
+
+  it("a native Claude opened by hand follows its screen, done and all", () => {
     const s = new RuntimeState();
-    s.claim({ pane_id: 73, agent: "claude" });
-    s.report({ v: 1, pane_id: 73, launch_id: s.get(73).terminal_id, source: "tern:claude", agent: "claude", state: "unknown", seq: 1 });
-    // Pending probe pushes the classified dialog (rule id as message).
-    s.observe({ v: 1, generation: "w1", agents: [{ pane: 73, agent: "claude", state: "blocked", message: "trust_directory" }], panes: [] });
-    const b = s.get(73);
-    assert.equal(b.agent_status, "blocked");
-    assert.equal(b.message, "trust_directory");
+    s.observe({ v: 1, generation: "tern-discovery", agents: [{ pane: 5, agent: "claude", state: "unknown" }], panes: [{ pane: 5, tab: 9 }] });
+    assert.equal(s.get(5).agent_status, "unknown");
+    s.detect(5, S("claude", "idle", { visible_idle: true, at: 1 }));
+    assert.equal(s.get(5).agent_status, "idle", "the first idle is never a completion");
+    s.detect(5, S("claude", "working", { at: 2 }));
+    s.detect(5, S("claude", "idle", { visible_idle: true, at: 3 }));
+    assert.equal(s.get(5).agent_status, "done");
+    assert.ok(s.get(5).completion_seq > 0);
   });
-  it("reported working is never downgraded by an idle surface; reported blocked stands", () => {
+
+  it("a blocked startup dialog answered into idle is not a completion (acquisition)", () => {
     const s = new RuntimeState();
-    s.claim({ pane_id: 71, agent: "codex" });
-    s.report({ v: 1, pane_id: 71, launch_id: s.get(71).terminal_id, source: "tern:codex", agent: "codex", state: "working", seq: 1 });
-    s.observe({ v: 1, generation: "w1", agents: [{ pane: 71, agent: "codex", state: "idle" }], panes: [] });
-    assert.equal(s.get(71).agent_status, "working");
-    s.report({ v: 1, pane_id: 71, launch_id: s.get(71).terminal_id, source: "tern:codex", agent: "codex", state: "blocked", seq: 2, message: "approval" });
-    s.observe({ v: 1, generation: "w1", agents: [{ pane: 71, agent: "codex", state: "idle", ready: true }], panes: [] });
-    const b = s.get(71);
-    assert.equal(b.agent_status, "blocked");
-    assert.equal(b.message, "approval");
-    assert.equal(b.launch_pending, true);
+    s.claim({ pane_id: 6, agent: "claude", launch_id: "L6" });
+    s.detect(6, S("claude", "blocked", { visible_blocker: true, rule: "live_blocked_form", at: 1 }));
+    assert.equal(s.get(6).agent_status, "blocked");
+    s.detect(6, S("claude", "idle", { visible_idle: true, at: 2 }));
+    assert.equal(s.get(6).agent_status, "idle");
+    assert.equal(s.get(6).completion_seq, null);
+  });
+
+  it("readiness: a pending Claude or Codex is ready on its first idle screen; blocked keeps it pending", () => {
+    const s = new RuntimeState();
+    s.claim({ pane_id: 7, agent: "codex", launch_id: "L7" });
+    s.detect(7, S("codex", "blocked", { visible_blocker: true, rule: "trust_directory", at: 1 }));
+    assert.deepEqual([s.get(7).agent_status, s.get(7).message, s.get(7).launch_pending], ["blocked", "trust_directory", true]);
+    s.detect(7, S("codex", "idle", { visible_idle: true, at: 2 }));
+    assert.deepEqual([s.get(7).agent_status, s.get(7).interactive_ready, s.get(7).launch_pending], ["idle", true, false]);
+  });
+
+  it("a screen read for another agent than the occupant is ignored", () => {
+    const s = new RuntimeState();
+    s.claim({ pane_id: 8, agent: "claude", launch_id: "L8" });
+    assert.equal(s.detect(8, S("codex", "idle", { at: 1 })), false);
+    assert.equal(s.get(8).agent_status, "unknown");
+  });
+
+  it("any state but idle marks the pane seen (herdr apply_pane_state_change)", () => {
+    const s = new RuntimeState();
+    s.claim({ pane_id: 9, agent: "omp", launch_id: "L9" });
+    s.report(R(9, "L9", { state: "working", seq: 1 }));
+    s.report(R(9, "L9", { state: "idle", seq: 2 }));
+    assert.equal(s.get(9).agent_status, "done");
+    s.report(R(9, "L9", { state: "unknown", seq: 3 }));
+    s.report(R(9, "L9", { state: "idle", seq: 4 }));
+    assert.equal(s.get(9).agent_status, "idle");
+  });
+
+  it("every state change is announced, with completion and seen", () => {
+    const s = new RuntimeState();
+    const seen = [];
+    s.onTransition((t) => seen.push(`${t.prev}>${t.next}${t.completion ? "!" : ""}${t.seen ? "" : "~"}`));
+    s.claim({ pane_id: 10, agent: "omp", launch_id: "L10" });
+    s.report(R(10, "L10", { state: "working", seq: 1 }));
+    s.report(R(10, "L10", { state: "blocked", seq: 2, message: "q" }));
+    s.report(R(10, "L10", { state: "idle", seq: 3 }));
+    assert.deepEqual(seen, ["idle>working", "working>blocked", "blocked>idle!~"]);
+  });
+});
+
+describe("omp start readiness (bug: ready inside the first-run wizard)", () => {
+  it("the extension's ready waits for a clean startup screen; a wizard on screen is blocked", () => {
+    const s = new RuntimeState();
+    const c = s.claim({ pane_id: 20, agent: "omp", launch_id: "L20" });
+    s.report(R(20, "L20", { state: "idle", seq: 1, ready: true, session_start: true }));
+    assert.equal(s.get(20).interactive_ready, false, "no screen read yet");
+    s.detect(20, S("omp", "blocked", { visible_blocker: true, rule: "omp_setup_wizard", at: 1 }));
+    assert.deepEqual([s.get(20).agent_status, s.get(20).message, s.get(20).launch_pending], ["blocked", "omp_setup_wizard", true]);
+    s.detect(20, S("omp", "idle", { at: 2 }));
+    assert.deepEqual([s.get(20).agent_status, s.get(20).interactive_ready, s.get(20).launch_pending], ["idle", true, false]);
+    assert.equal(s.get(20).terminal_id, c.terminal_id);
+  });
+
+  it("the native surface never makes a pending omp ready", () => {
+    const s = new RuntimeState();
+    s.claim({ pane_id: 21, agent: "omp", launch_id: "L21" });
+    s.observe({ v: 1, generation: "w1", agents: [{ pane: 21, agent: "omp", state: "idle", ready: true }], panes: [] });
+    assert.equal(s.get(21).interactive_ready, false);
+    assert.equal(s.get(21).launch_pending, true);
+  });
+
+  it("once ready, the screen no longer moves an omp: its extension owns the lifecycle", () => {
+    const s = new RuntimeState();
+    s.claim({ pane_id: 22, agent: "omp", launch_id: "L22" });
+    s.report(R(22, "L22", { state: "idle", seq: 1, ready: true }));
+    s.detect(22, S("omp", "idle", { at: 1 }));
+    s.report(R(22, "L22", { state: "working", seq: 2 }));
+    s.detect(22, S("omp", "blocked", { visible_blocker: true, rule: "omp_setup_wizard", at: 2 }));
+    assert.equal(s.get(22).agent_status, "working");
+  });
+});
+
+describe("native exit (bug: a stale native entry blocked start)", () => {
+  it("a pane the process probe found free loses its native entry and keeps it off while free", () => {
+    const s = new RuntimeState();
+    s.observe({ v: 1, generation: "w1", agents: [{ pane: 30, agent: "omp", state: "idle" }], panes: [] });
+    assert.equal(s.releaseNative(30), true);
+    assert.throws(() => s.get(30), (e) => e.code === "agent_not_found");
+    // The rail's stale list still names it: no new native while the pane is free.
+    s.observe({ v: 1, generation: "w1", agents: [{ pane: 30, agent: "omp", state: "unknown" }], panes: [] });
+    assert.throws(() => s.get(30), (e) => e.code === "agent_not_found");
+    // A start can claim it.
+    s.claim({ pane_id: 30, agent: "omp", launch_id: "L30" });
+    assert.equal(s.get(30).launch_pending, true);
+  });
+
+  it("an agent seen again in the pane lifts the free mark", () => {
+    const s = new RuntimeState();
+    s.observe({ v: 1, generation: "w1", agents: [{ pane: 31, agent: "omp", state: "idle" }], panes: [] });
+    s.releaseNative(31);
+    s.clearFree(31);
+    s.observe({ v: 1, generation: "w1", agents: [{ pane: 31, agent: "omp", state: "working" }], panes: [] });
+    assert.equal(s.get(31).agent_status, "working");
+  });
+
+  it("never releases a connector occupant", () => {
+    const s = new RuntimeState();
+    s.claim({ pane_id: 32, agent: "omp", launch_id: "L32" });
+    assert.equal(s.releaseNative(32), false);
+    assert.equal(s.get(32).launch_pending, true);
   });
 });
 
@@ -475,12 +597,12 @@ describe("discovery cadence", () => {
     });
   });
 
-  it("discovers at poll rate while a launch is pending", async () => {
+  it("a pending launch does not speed discovery up: the detection loop watches it", async () => {
     await withServe(async ({ handle, calls }) => {
       handle.state.claim({ pane_id: 700, agent: "claude", name: "bot", launch_id: "L7" });
       await handle.ingest();
       await handle.ingest();
-      assert.equal(calls.list, 2);
+      assert.equal(calls.list, 1);
     });
   });
 
@@ -552,49 +674,6 @@ describe("snapshot pane index", () => {
       await handle.persist({ heartbeat: true });
       const snap = JSON.parse(readFileSync(join(dir, "snapshot.json"), "utf8"));
       assert.deepEqual(snap.panes, [{ pane_id: 500, tab_id: 2 }, { pane_id: 501, tab_id: 2 }]);
-    } finally {
-      await handle.close();
-      rmSync(dir, { recursive: true, force: true });
-    }
-  });
-});
-
-describe("chime handoff", () => {
-  // A spawn from a window hook can pass Tern's 50 ms budget on its own and freeze the
-  // rail, so the aside hands its chime to the daemon in the observation file and the
-  // daemon starts the player. Once per chime seq, and only while the chime is fresh
-  // next to the observation's own clock: a heartbeat or a later daemon never replays.
-  it("plays a fresh chime once and never a stale or repeated one", async () => {
-    const { mkdtempSync, rmSync, writeFileSync, utimesSync } = await import("node:fs");
-    const { tmpdir } = await import("node:os");
-    const { join } = await import("node:path");
-    const { serve } = await import("./server.mjs");
-    const dir = mkdtempSync(join(tmpdir(), "rt-chime-"));
-    const played = [];
-    const handle = await serve({ dataDir: dir, pollMs: 3600000, playChime: (kind) => played.push(kind) });
-    const obsFile = join(dir, "observation-vm-test.json");
-    let seq = 0;
-    const write = (observedAt, chime) => {
-      seq += 1;
-      writeFileSync(obsFile, JSON.stringify({ v: 1, generation: "vm-test", seq, observed_at: observedAt, agents: [], panes: [], chime }));
-      // Each write a distinct mtime, as the VM's real writes are: the daemon skips a
-      // file whose mtime it has already ingested.
-      const t = Date.now() / 1000 + seq;
-      utimesSync(obsFile, t, t);
-    };
-    try {
-      write(1000, { seq: 1, kind: "request", at: 1000 });
-      await handle.ingest();
-      assert.deepEqual(played, ["request"]);
-      write(6000, { seq: 1, kind: "request", at: 1000 });
-      await handle.ingest();
-      assert.deepEqual(played, ["request"], "a heartbeat carrying the same chime seq never replays it");
-      write(20000, { seq: 2, kind: "done", at: 9000 });
-      await handle.ingest();
-      assert.deepEqual(played, ["request"], "a chime the observation's own clock left behind is stale");
-      write(30000, { seq: 3, kind: "done", at: 30000 });
-      await handle.ingest();
-      assert.deepEqual(played, ["request", "done"]);
     } finally {
       await handle.close();
       rmSync(dir, { recursive: true, force: true });
